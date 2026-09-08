@@ -1,0 +1,15 @@
+# config / secrets
+mewcode.yaml
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# build artifacts
+*.egg-info/
+dist/
+build/

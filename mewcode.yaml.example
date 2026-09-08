@@ -1,0 +1,18 @@
+# 复制为 mewcode.yaml 后填写。真实 key 永远不要提交进版本库。
+# 一份文件 = 当前激活的后端。`protocol` 决定用哪个客户端。
+
+# --- Anthropic（Claude） ---
+protocol: anthropic
+model: claude-sonnet-4-5
+base_url: ""            # 留空 => https://api.anthropic.com
+api_key: 你的_anthropic_key
+# max_output_tokens: 1024
+thinking: true          # 开启 Claude 的 extended thinking
+thinking_budget: 1024
+
+# --- 或 OpenAI ---
+# protocol: openai
+# model: gpt-4o-mini
+# base_url: ""          # 留空 => https://api.openai.com/v1
+# api_key: 你的_openai_key
+# thinking: false
