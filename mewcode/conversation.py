@@ -158,6 +158,12 @@ class ConversationManager:
                 return m.thinking_signature  # 返回它
         return ""  # 翻完都没有 → 返回空串
 
+    def restore(self, messages: list[Message]) -> None:
+        # ↓↓ ch4 新增：Agent 在做 max_tokens 升档重试时，要能把历史"回滚"到
+        #    本轮开始前的快照，防止那次被截断的半截回答残留在历史里造成重复。↓↓
+        self._reset()  # 先把进行中、没收口的临时状态清干净
+        self.messages = list(messages)  # 把历史整体替换成调用方给的快照
+
     def clear(self) -> None:  # 清空整本笔记本（开新对话用）
         if self._open:  # 如果有没收口完的轮
             self.close_turn()  # 先收口
