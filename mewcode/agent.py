@@ -127,12 +127,15 @@ class Agent:
     ) -> None:
         self.client = client
         self.registry = registry
+        # 真去执行工具的人。不给的话，Agent自己拿registry造一个(ToolRunner(registry)),所以可以不传
         self.runner = runner if runner is not None else ToolRunner(registry)
+        # 最多循环几回合。防死循环的护栏
         self.max_iterations = max_iterations
         self._turn_stop = ""  # 最近一轮停下来的 stop_reason(生成器跨 yield 传值用)
         # 预算相关：从 config 读当前默认，作为"未升档时的基数"
         self._budget = getattr(client.config, "max_output_tokens", 1024)
         self.max_budget = max_budget or max(2048, int(self._budget * 8))
+        # max_tokens截断时，每次把字数上限乘系数
         self.escalation_factor = escalation_factor
         # 空位照单收下(本版不实现，仅占位)
         self.permission_checker = permission_checker
@@ -143,6 +146,8 @@ class Agent:
         """算升档后的新预算：旧的乘上系数，但顶到天花板为止。"""
         return min(int(old * self.escalation_factor), self.max_budget)
 
+    # run实际上就是在反复问模型，直到他不再要工具
+    # 逻辑就是问模型，如果模型要调用工具，把工具结果赛会聊天记录，再重新问一遍模型。一直重复，知道模型说人话不再调用工具，或者循环次数上限强制停止
     async def run(
         self,
         cm: ConversationManager,
@@ -168,8 +173,12 @@ class Agent:
 
             # ④ 模型要动手：真去跑这一批工具，逐个回灌 + 吐事件
             yield AgentToolBatch(turn=turn, calls=len(calls))
+            # 向外抛出事件 AgentToolBatch 通知上层，本轮即将执行 n 个工具调用
             results = await self.runner.run_all(calls)
+            # 工具执行结果添加到 ConversationManager对话历史
             cm.add_tool_results(results)
+            
+            # 逐个对外抛出AgentToolResult事件，上层拿到每个工具的返回内容，可以做日志，界面展示
             for r in results:
                 yield AgentToolResult(result=r)
             # ← 关键：不 return，回到 for 开头"再调模型"，直到上面③触发收场
@@ -177,6 +186,7 @@ class Agent:
         # ⑤ 到迭代上限还没收场 → 安全刹车，防死循环
         yield AgentFinished(reason="max_iterations", turns=self.max_iterations)
 
+    # 异步生成器
     async def _emit_turn(
         self, cm: ConversationManager, system: str, schemas: list, turn: int
     ) -> str:

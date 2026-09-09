@@ -18,12 +18,19 @@ import asyncio
 import os
 import sys
 
+from .agent import (  # ch04：用 Agent 驱动"自动反复动手"的循环
+    Agent,
+    AgentFinished,
+    AgentToolBatch,
+    AgentToolResult,
+    AgentTokensEscalated,
+)
 from .client import create_client
 from .config import ProviderConfig, load_config
 from .conversation import ConversationManager
 from .errors import LLMError, RateLimitError
-from .tools import ToolRunner, build_default_registry  # ch03：工具执行器 + 默认登记中心
-from .tools.base import TextDelta, ThinkingComplete, ThinkingDelta
+from .tools import build_default_registry  # ch04：Agent 内部自己造 ToolRunner
+from .tools.base import TextDelta, ThinkingDelta
 
 _DIM = "\x1b[2m"  # ANSI转义码： 暗色文本
 _RESET = "\x1b[0m"  # ANSI转义码： 回复终端默认颜色
@@ -36,62 +43,43 @@ def _print_assistant_text(chunk: str) -> None:
     sys.stdout.flush()
 
 
-# 一轮模型流式对话核心函数（ch03 起：模型可能"想调工具"，真去执行并回灌）
-async def _stream_one(
-    client,
+# 一轮对话核心函数（ch04 起：由 Agent 驱动"自动反复动手"的循环）
+async def _run_agent_turn(
+    agent: Agent,  # ch04：把 client + registry 串成自动循环的人
     cm: ConversationManager,
     system: str,
     show_thinking: bool,
-    runner: ToolRunner,  # ch03：真执行工具的人
-    schemas: list,  # ch03：工具 schema 清单，随请求发给模型
 ) -> None:
-    """针对 cm 的当前历史跑一轮助手回复；若模型声明要调工具则执行并回灌结果。
+    """跑一段 Agent 自动循环：边消费 run() 吐的事件，边渲染给用户。
 
-    流式错误不再走事件，而是由 client.stream() 抛出 `errors` 里的统一异常（spec F7），
-    会直接传播给 run() 的统一 except 处理；这里只管正常事件与收口。
-
-    ★ 本章"单发"：模型调工具 → 我们真执行 → 结果回灌历史并打印 → 就停，
-      不再自动拿结果去追问模型（多轮 AgentLoop 留给下一章）。
+    Agent.run() 内部会自己反复问模型、执行工具、回灌结果，直到模型不再要工具
+    或撞到迭代上限。这里只负责"看事件、打印"，不碰任何判断逻辑（UI = 显示器）。
     """
     started = False
-    try:
-        # client.stream()是异步流式接口，源源不断产出事件对象，不是一次性返回完整字符串。
-        # tools=schemas：把六个工具的"长相"发给模型，它才知道能点名调用谁。
-        async for event in client.stream(cm.messages, system=system, tools=schemas):
-            if isinstance(event, TextDelta):
-                started = True
-                _print_assistant_text(event.text)
-                # 收到普通文本片段，直接打印，标记已经开始输出
-            elif isinstance(event, ThinkingDelta):
-                started = True
-                if show_thinking:
-                    _print_assistant_text(_DIM + event.text + _RESET)
-            # 模型思考内容。只有开启--show-thinking才打印，并且颜色暗色显示
-            elif isinstance(event, ThinkingComplete):
-                pass  # 签名属于内部管道，交给 ConversationManager 收集即可
-            # 思考签名，内部校验元数据，不展示给用户，交给会话管理器记录
-            cm.record_event(event)
-            # 非常关键，无论什么事件，全部交给会话管理器记录，保存完整对话历史，下一轮提问带上全部上下文
-        if not started:
-            print("(no reply)")  # 流正常结束，但是没有任何内容输出时提示
-    finally:
-        cm.close_turn()  # 把这一轮助手消息收口进历史（含它想调的工具 tool_uses）
-        print()
-
-    # --- ch03：看看这一轮模型是否声明了要调工具 ---
-    # close_turn 之后，历史里最后一条就是刚收口的 assistant 消息，翻它的工具口袋。
-    last = cm.messages[-1] if cm.messages else None
-    calls = last.tool_uses if last is not None else []
-    if calls:  # 模型确实想动手 → 我们替它真去执行
-        print()  # 空行隔开工具执行的过程
-        results = await runner.run_all(calls)  # 挨个真跑：查表→执行→套超时→兜错
-        cm.add_tool_results(results)  # 把结果回灌进历史（作为一条 user 消息）
-        # 把每个工具干了什么、结果如何，逐条打印给用户看
-        for r in results:
+    # agent.run(cm) 会一路 yield 事件：文字碎片 / 要跑工具 / 工具结果 / 结束……
+    async for ev in agent.run(cm, system=system):
+        if isinstance(ev, TextDelta):
+            started = True
+            _print_assistant_text(ev.text)  # 模型说的字，流式打出来
+        elif isinstance(ev, ThinkingDelta):
+            started = True
+            if show_thinking:
+                _print_assistant_text(_DIM + ev.text + _RESET)
+        elif isinstance(ev, AgentToolBatch):
+            print(f"\n(round {ev.turn}: 这一轮要跑 {ev.calls} 个工具)")
+        elif isinstance(ev, AgentToolResult):
+            r = ev.result
             tag = "✗" if r.is_error else "✓"
             print(f"{tag} tool {r.tool_use_id} -> {r.content}")
-        # ★ 单发结束：不拿结果再去问模型，等用户下一条指令
-        print("(工具已执行；结果已回填历史。)")
+        elif isinstance(ev, AgentTokensEscalated):
+            print(f"\n[max_tokens 耗尽：单轮预算 {ev.old_max} -> {ev.new_max}，整轮重试]")
+        elif isinstance(ev, AgentFinished):
+            # 收场原因：(model_done 正常干完 / max_iterations 到上限强制刹车)
+            if ev.reason == "max_iterations":
+                print(f"\n[到迭代上限 {ev.turns} 轮仍未结束，强制收场]")
+    if not started and cm.messages and cm.messages[-1].role == "user":
+        print("(no reply)")  # 流正常结束但模型没吐任何字时提示
+    print()  # 收尾换行，回到输入提示
 
 # 主聊天循环 async
 # 整体功能
@@ -99,11 +87,10 @@ async def _stream_one(
 async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False) -> int:
     client = create_client(cfg)
     cm = ConversationManager()
-    # ch03：造一张登记中心 + 一个执行器。工作根默认取启动终端所在目录，
-    # 六个工具的相对路径都从它解析。
+    # ch04：造一张登记中心，再让 Agent 包住 client + registry 去自动反复动手。
+    # 工作根默认取启动终端所在目录，六个工具的相对路径都从它解析。
     registry = build_default_registry(base_dir=os.getcwd())
-    runner = ToolRunner(registry)
-    schemas = registry.schemas()  # 工具"长相"清单，发给模型让它能点名调用
+    agent = Agent(client=client, registry=registry)
     print(f"MewCode  |  protocol={cfg.protocol}  model={cfg.model}")
     print(f"tools: {', '.join(registry.names())}")  # 提醒用户模型手上有哪些工具
     print("Type a message, or /exit /clear /model.  Ctrl+C aborts the current reply.\n")
@@ -144,8 +131,9 @@ async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False
         # 输入普通问题的时候调用
         cm.add_user(text)
         try:
-            # 调用大模型流式输出（ch03 起：带上 runner/schemas，模型可调工具并被真执行）
-            await _stream_one(client, cm, system, show_thinking, runner, schemas)
+            # 让 Agent 自动循环：反复问模型→跑工具→回灌，直到它不再要工具。
+            # Agent 内部自己造 runner/schemas，cli 只当"显示器"看它吐的事件。
+            await _run_agent_turn(agent, cm, system, show_thinking)
             # except处理调用大模型期间的异常
         except KeyboardInterrupt:
             print("\n(aborted)")
@@ -157,8 +145,7 @@ async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False
             else:
                 print(f"\n[error] {exc}")
         except Exception as exc:  # noqa: BLE001 — REPL 必须保持存活
-            import os
-            if os.environ.get("MEW_DEBUG"):
+            if os.environ.get("MEW_DEBUG"):  # os 已在本模块顶部 import，此处直接用
                 raise
             print(f"\n[error] {exc}")
     return 0

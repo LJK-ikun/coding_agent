@@ -38,7 +38,7 @@ class FakeClient:
     def set_max_output_tokens(self, n):
         self.set_calls.append(n)
 
-    async def stream(self, _messages, _system="", _tools=None):
+    async def stream(self, messages, system="", tools=None):
         idx = min(self.calls, len(self.scripts) - 1)
         self.calls += 1
         for ev in self.scripts[idx]:
