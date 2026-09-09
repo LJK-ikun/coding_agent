@@ -2,7 +2,7 @@
 
 一个跑在终端的 **AI CodingAgent** 框架(Python 实现)。目标是让模型不只"会说话",还能真正**动手**:读文件、写文件、改文件、执行命令、找文件、搜代码——像一个能替你干活的 agent。
 
-当前进度:**ch03 工具系统(单发)**。
+当前进度:**ch05 指令工程(模块化 system + 环境分流 + prompt 缓存)**。
 
 ## 它能做什么
 
@@ -61,6 +61,7 @@ protocol: anthropic
 model: claude-sonnet-4-5
 api_key: sk-ant-...
 thinking: true        # 开启 extended thinking
+prompt_caching: true  # ch05: 缓存稳定 system+工具前缀,省重复 token(anthropic 专属)
 
 # --- 或 OpenAI(二者选一,注释掉另一份)---
 # protocol: openai
@@ -80,21 +81,24 @@ python -m mewcode mewcode.yaml --show-thinking
 ## 怎么测
 
 ```bash
-python -m pytest          # 33 条用例:ch02 传输层 17 + ch03 工具系统 16
+python -m pytest          # 50 条用例:传输层 17 + 工具系统 16 + ch04 Agent 若干 + ch05 指令工程 14
 ```
 
 ## 项目结构
 
 ```
 mewcode/
-├── cli.py            # REPL 主流程(开场介绍工具 → 单发驱动)
-├── client.py         # LLM 客户端:Anthropic / OpenAI,工具块序列化
+├── cli.py            # REPL 主流程(装配稳定 system → 每轮送 env → 驱动 Agent)
+├── client.py         # LLM 客户端:Anthropic / OpenAI,工具块 + 缓存断点序列化
+├── prompts.py        # ch05:指令零件 PromptModule + 装配器 + collect_env(稳定/易变分流)
 ├── conversation.py   # 对话历史:折叠流式工具调用、回灌工具结果
+├── agent.py          # AgentLoop:调模型→跑工具→回灌,自动反复动手
 ├── models.py         # 统一消息模型(ToolUse / ToolCallResult)
-├── config.py         # YAML 配置层
+├── config.py         # YAML 配置层(含 prompt_caching 开关)
 └── tools/
     ├── interface.py  # 地基:ToolResult(收据)+ Tool(统一接口)
     ├── core.py       # 六个核心工具
+    ├── base.py       # 流式事件(TextDelta / ToolCall* / StreamEnd 含缓存计量)
     ├── registry.py   # 注册中心:名字 → 工具
     └── runner.py     # 执行器:查表 / 套超时 / 兜错
 ```
@@ -102,8 +106,10 @@ mewcode/
 ## 分层路线图
 
 - **ch01** 配置层 · **ch02** LLM 传输层(让 AI 开口,流式 + thinking + 双厂商)
-- **ch03** 工具系统(本版):让模型能动手——单发工具循环
-- 后续规划:**多轮 AgentLoop**(拿结果自动追问)、上下文 Compact、SubAgent / Skill / Team 编排、工具执行前的确认门卫
+- **ch03** 工具系统:让模型能动手——单发工具循环
+- **ch04** AgentLoop:多轮自动循环(拿结果反复动手)
+- **ch05** 指令工程(本版):模块化 system + 环境分流 + prompt 缓存
+- 后续规划:上下文 Compact、SubAgent / Skill / Team 编排、运行时指令注入、工具执行前的确认门卫
 
 ## 明确不做(当前范围外)
 

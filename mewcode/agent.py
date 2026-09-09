@@ -45,7 +45,7 @@ from typing import Any, Optional, Union
 
 from .client import LLMClient
 from .conversation import ConversationManager
-from .models import ToolCallResult
+from .models import ROLE_USER, Message, ToolCallResult
 from .tools.base import StreamEnd, TextDelta, ThinkingDelta
 from .tools.registry import ToolRegistry
 from .tools.runner import ToolRunner
@@ -152,6 +152,7 @@ class Agent:
         self,
         cm: ConversationManager,
         system: str = "",
+        env: str = "",  # ch05：易变环境上下文(每轮现取)，不落 cm 历史
     ) -> AsyncIterator[AgentEvent]:
         """跑整段自动循环，边跑边吐事件。结束原因见 `AgentFinished`。"""
         schemas = self.registry.schemas()  # 工具"说明书"，每轮随请求发给模型
@@ -159,7 +160,7 @@ class Agent:
             # ① 跑一轮模型回复(含升档重试)，把该轮的流事件转发给上层。
             #    生成器不能 return 值，所以它把"停下来的原因"存进 _turn_stop。
             self._turn_stop = ""
-            async for _ev in self._emit_turn(cm, system, schemas, turn):
+            async for _ev in self._emit_turn(cm, system, env, schemas, turn):
                 yield _ev  # 把这一轮吐给上层的事件原样转出去
             stop_reason = self._turn_stop
 
@@ -188,17 +189,23 @@ class Agent:
 
     # 异步生成器
     async def _emit_turn(
-        self, cm: ConversationManager, system: str, schemas: list, turn: int
+        self, cm: ConversationManager, system: str, env: str, schemas: list, turn: int
     ) -> str:
         """跑"一个回合"的模型回复；若被 max_tokens 截断则升档并整轮重试。
 
         返回该轮最终停下来的 stop_reason（end_turn / max_tokens 已重试后仍耗尽）。
         """
         snapshot = list(cm.messages)  # 本轮开始前的历史快照（升档重试要回滚到它）
+        # ch05：把"易变环境上下文"作为首条临时 user 消息拼进发给模型的请求，
+        #       但【不写回 cm 历史】——它每轮现取现抛、位置在缓存断点之后，
+        #       既不污染正式历史，也不触碰被缓存的稳定前缀。
+        outgoing = list(cm.messages)
+        if env:
+            outgoing.insert(0, Message(role=ROLE_USER, content=env))
         while True:
             stop_reason = ""
             # 让模型开口：把它吐的每个事件都记进历史，同时把"说话"转发给上层
-            async for ev in self.client.stream(cm.messages, system=system, tools=schemas):
+            async for ev in self.client.stream(outgoing, system=system, tools=schemas):
                 cm.record_event(ev)  # 无论什么事件都先记历史(Agent 的"记忆")
                 if isinstance(ev, TextDelta):
                     yield ev  # 把模型说的字转发给上层实时显示

@@ -29,8 +29,9 @@ from .client import create_client
 from .config import ProviderConfig, load_config
 from .conversation import ConversationManager
 from .errors import LLMError, RateLimitError
+from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 system + 取环境
 from .tools import build_default_registry  # ch04：Agent 内部自己造 ToolRunner
-from .tools.base import TextDelta, ThinkingDelta
+from .tools.base import StreamEnd, TextDelta, ThinkingDelta
 
 _DIM = "\x1b[2m"  # ANSI转义码： 暗色文本
 _RESET = "\x1b[0m"  # ANSI转义码： 回复终端默认颜色
@@ -47,7 +48,8 @@ def _print_assistant_text(chunk: str) -> None:
 async def _run_agent_turn(
     agent: Agent,  # ch04：把 client + registry 串成自动循环的人
     cm: ConversationManager,
-    system: str,
+    system: str,  # ch05：启动时装配一次的稳定 system
+    env: str,  # ch05：这一轮的易变环境上下文(每轮现取，不进缓存前缀)
     show_thinking: bool,
 ) -> None:
     """跑一段 Agent 自动循环：边消费 run() 吐的事件，边渲染给用户。
@@ -57,7 +59,7 @@ async def _run_agent_turn(
     """
     started = False
     # agent.run(cm) 会一路 yield 事件：文字碎片 / 要跑工具 / 工具结果 / 结束……
-    async for ev in agent.run(cm, system=system):
+    async for ev in agent.run(cm, system=system, env=env):
         if isinstance(ev, TextDelta):
             started = True
             _print_assistant_text(ev.text)  # 模型说的字，流式打出来
@@ -73,6 +75,12 @@ async def _run_agent_turn(
             print(f"{tag} tool {r.tool_use_id} -> {r.content}")
         elif isinstance(ev, AgentTokensEscalated):
             print(f"\n[max_tokens 耗尽：单轮预算 {ev.old_max} -> {ev.new_max}，整轮重试]")
+        elif isinstance(ev, StreamEnd):
+            # ch05：把 prompt 缓存计量露出来——cache_read>0 说明这轮复用了缓存前缀
+            if ev.cache_read_input_tokens or ev.cache_creation_input_tokens:
+                print(
+                    f"\n[cache] 读 {ev.cache_read_input_tokens} tok / 写 {ev.cache_creation_input_tokens} tok"
+                )
         elif isinstance(ev, AgentFinished):
             # 收场原因：(model_done 正常干完 / max_iterations 到上限强制刹车)
             if ev.reason == "max_iterations":
@@ -131,9 +139,15 @@ async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False
         # 输入普通问题的时候调用
         cm.add_user(text)
         try:
+            # ch05：每个用户回合现取一次环境(时间/git 会变)，并标成"仅供上下文参考"，
+            # 让 Agent 把它作为首条临时消息送出去——不落历史、不进缓存前缀。
+            env = (
+                "[环境信息·仅供上下文参考，不必当作需要回答的问题]\n"
+                + collect_env(os.getcwd())
+            )
             # 让 Agent 自动循环：反复问模型→跑工具→回灌，直到它不再要工具。
             # Agent 内部自己造 runner/schemas，cli 只当"显示器"看它吐的事件。
-            await _run_agent_turn(agent, cm, system, show_thinking)
+            await _run_agent_turn(agent, cm, system, env, show_thinking)
             # except处理调用大模型期间的异常
         except KeyboardInterrupt:
             print("\n(aborted)")
@@ -154,7 +168,11 @@ async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="mewcode", description="终端 AI CodingAgent（ch02）")
     ap.add_argument("config", nargs="?", default="mewcode.yaml", help="YAML 配置文件路径")
-    ap.add_argument("--system", default="", help="可选的系统提示词")
+    ap.add_argument(
+        "--system",
+        default="",
+        help="可选的系统提示词。缺省时用内置模块(ch05 build_system_prompt)自动装配",
+    )
     ap.add_argument("--show-thinking", action="store_true", help="同时打印模型的思考/推理过程")
     args = ap.parse_args(argv)
     # 把标准输入输出都强制成 UTF-8：否则在 GBK 控制台/管道里，中文输入会被按
@@ -170,7 +188,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     try:
-        return asyncio.run(run(cfg, system=args.system, show_thinking=args.show_thinking))
+        # ch05：稳定 system 只在启动时装配一次(不随每轮 env 变)——
+        # 传了 --system 就用它，否则用内置模块按优先级拼装。
+        stable_system = args.system if args.system else build_system_prompt()
+        return asyncio.run(
+            run(cfg, system=stable_system, show_thinking=args.show_thinking)
+        )
     except KeyboardInterrupt:
         return 130
 

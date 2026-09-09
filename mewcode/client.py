@@ -262,6 +262,26 @@ class AnthropicClient(LLMClient):
             blocks.append({"type": "text", "text": m.content})
         return blocks or [{"type": "text", "text": ""}]
 
+    def _cached_system_blocks(self, system: str) -> list[dict[str, Any]]:
+        """ch05：把稳定 system 包成一个带 `cache_control` 断点的文本块。
+
+        Anthropic 的 system 可以是文本块列表；在某块上加 `cache_control` 就把它当成
+        缓存断点，缓存"从请求最开头到这里的整个前缀"。稳定 system 放在最前并断点，
+        它就成了每轮都能被命中、不必重复付费的前缀。
+        """
+        return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
+    def _with_cached_tools(self, tools: list[dict]) -> list[dict]:
+        """ch05：在**最后一个**工具上打缓存断点。
+
+        工具列表紧随 system 之后；给末个工具加断点，等于把"system + 全部工具"这段
+        稳定前缀整体纳入缓存。浅拷贝一份再加，避免污染调用方手里的 schema dict。
+        """
+        out = [dict(t) for t in tools]  # 每个工具的 dict 浅拷贝
+        if out:
+            out[-1] = dict(out[-1], cache_control={"type": "ephemeral"})  # 末个工具上断点
+        return out
+
     def _build_body(
         self, messages: list[Message], system: str = "", tools: list[dict] | None = None
     ) -> dict[str, Any]:
@@ -284,9 +304,19 @@ class AnthropicClient(LLMClient):
             "messages": api_messages,
         }
         if system:
-            body["system"] = system
+            # ch05：prompt_caching 开时，稳定 system 包成带缓存断点的文本块(见下)。
+            #       默认关 → 仍发纯字符串，保住 ch02 精确相等断言。
+            body["system"] = (
+                system
+                if not self.config.prompt_caching
+                else self._cached_system_blocks(system)
+            )
         if tools:  # ch03：有工具就随请求发 schema，让模型知道有哪些手可用
-            body["tools"] = tools
+            body["tools"] = (
+                tools
+                if not self.config.prompt_caching
+                else self._with_cached_tools(tools)
+            )
         thinking = self._thinking_param(messages)
         if thinking:
             body["thinking"] = thinking
@@ -311,6 +341,9 @@ class AnthropicClient(LLMClient):
         input_tokens = 0
         output_tokens = 0
         stop_reason = ""
+        # ch05：prompt 缓存计量——这轮"读缓存/写缓存"各多少 token(不支持则 0)
+        cache_read = 0
+        cache_created = 0
         sig_emitted = False
         block_kind: dict[int, str] = {}
         tool_buf: dict[int, dict[str, Any]] = {}
@@ -323,7 +356,12 @@ class AnthropicClient(LLMClient):
             async for event in stream:
                 t = event.type
                 if t == "message_start":
-                    input_tokens = event.message.usage.input_tokens if event.message.usage else 0
+                    usage = event.message.usage
+                    if usage:
+                        input_tokens = usage.input_tokens
+                        # ch05：usage 里 cache_read/cache_creation 是整型计数；字段缺失为 None
+                        cache_read = usage.cache_read_input_tokens or 0
+                        cache_created = usage.cache_creation_input_tokens or 0
                 elif t == "content_block_start":
                     cb = event.content_block
                     block_kind[event.index] = cb.type
@@ -364,8 +402,10 @@ class AnthropicClient(LLMClient):
                             )
                 elif t == "message_delta":
                     stop_reason = event.delta.stop_reason or ""
-                    if event.usage:
+                    if event.usage:  # 累计 usage：顺手把缓存计量也收齐(覆盖 message_start 的空缺)
                         output_tokens = event.usage.output_tokens
+                        cache_read = event.usage.cache_read_input_tokens or cache_read
+                        cache_created = event.usage.cache_creation_input_tokens or cache_created
                 elif t == "message_stop":
                     break
         except anthropic.APIStatusError as exc:
@@ -379,6 +419,8 @@ class AnthropicClient(LLMClient):
             stop_reason=stop_reason,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_created,
         )
 
 
@@ -401,6 +443,13 @@ class OpenAIClient(LLMClient):
         items: list[dict[str, Any]] = []
         for m in messages:
             if m.role == "assistant":
+                # 推理回传：DeepSeek 等推理模型在多轮(尤其工具调用)里要求把上一段
+                # reasoning_text 原样带回，否则 400 "reasoning_text must be passed back"。
+                if m.thinking:
+                    items.append({
+                        "type": "reasoning",
+                        "content": [{"type": "reasoning_text", "text": m.thinking}],
+                    })
                 if m.content:  # 有文字就放一段 assistant 文字 item
                     items.append(
                         {"role": "assistant",
@@ -465,6 +514,10 @@ class OpenAIClient(LLMClient):
                 t = event.type
                 if t == "response.output_text.delta":
                     yield TextDelta(_clean_text(event.delta))
+                elif t == "response.reasoning_text.delta":
+                    # DeepSeek 等推理模型：思考是明文流式到达的，收成 ThinkingDelta，
+                    # 让 ConversationManager 存进 Message.thinking，供下一轮回传用。
+                    yield ThinkingDelta(_clean_text(getattr(event, "delta", "")))
                 elif t == "response.output_item.added":
                     item = event.item
                     if getattr(item, "type", None) == "function_call":

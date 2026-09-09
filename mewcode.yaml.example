@@ -9,6 +9,7 @@ api_key: 你的_anthropic_key
 # max_output_tokens: 1024
 thinking: true          # 开启 Claude 的 extended thinking
 thinking_budget: 1024
+prompt_caching: true    # ch05：开启 prompt 缓存(稳定 system+工具前缀被缓存，省重复 token)
 
 # --- 或 OpenAI ---
 # protocol: openai

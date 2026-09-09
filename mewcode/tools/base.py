@@ -104,11 +104,18 @@ class ToolCallComplete:  # 信封6：参数凑齐了，可以动手执行了
 
 @dataclass
 class StreamEnd:  # 信封7：这一轮响应说完了
-    """整条响应结束：含停止原因与 token 统计。"""
+    """整条响应结束：含停止原因与 token 统计。
+
+    ch05 追加：两个"缓存命中"字段——只有支持 prompt caching 的后端(anthropic)
+    会填，其余后端保持默认 0。上层据此能看到"这轮省了多少重复前缀 token"。
+    """
 
     stop_reason: str = ""  # 为什么停了（如 end_turn 正常结束）
     input_tokens: int = 0  # 这一轮"发出去"的 token 数（计费用）
     output_tokens: int = 0  # 这一轮"收回来"的 token 数（计费用）
+    # ↓↓ ch05：prompt 缓存计量（anthropic 会填；无缓存后端为 0）↓↓
+    cache_read_input_tokens: int = 0  # 这轮从缓存"读回"了多少前缀 token
+    cache_creation_input_tokens: int = 0  # 这轮为将来"写入"缓存了多少 token
 
 
 # --- 额外：失败 -----------------------------------------------------------------

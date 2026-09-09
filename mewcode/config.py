@@ -65,6 +65,9 @@ class ProviderConfig:
     max_output_tokens: int = 1024  # 格子5: 每轮回复的 token 上限（默认 1024）
     thinking: bool = False  # 格子6: 要不要深度思考（默认关）
     thinking_budget: int = 1024  # 格子7: 思考最多花多少 token（默认 1024）
+    # 格子8: 是否开启 prompt 缓存(ch05)。默认关，保持旧行为不变；anthropic 开它后
+    #       会在稳定 system + 工具列表上加缓存断点，让每轮重复的前缀只付一次费。
+    prompt_caching: bool = False
 
     def resolved_base_url(self) -> str:  # 技能①：算出"最后真正去请求的网址"
         """返回实际请求地址：base_url 为空时用厂商默认值，再去掉末尾斜杠。"""
@@ -102,6 +105,7 @@ def load_config(path: str | Path) -> ProviderConfig:  # 读取器：给路径，
         max_output_tokens=int(raw.get("max_output_tokens", 1024)),  # 取上限；转成 int；默认 1024
         thinking=bool(raw.get("thinking", False)),  # 取思考开关；转成 bool；默认关
         thinking_budget=int(raw.get("thinking_budget", 1024)),  # 取思考预算；转 int；默认 1024
+        prompt_caching=bool(raw.get("prompt_caching", False)),  # 取缓存开关(ch05)；默认关
     )
     cfg.validate()  # 填完调 validate 做最后检查（漏了 key 之类在这报）
     return cfg  # 检查通过，把填好的盒子交出去，给后面的 client 用

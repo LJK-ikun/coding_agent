@@ -40,3 +40,32 @@
 ## 端到端验收（至少一条）
 - [ ] **全量测试**：`python -m pytest` 全部通过（17 条 ch02 旧用例 + 16 条 ch03 新用例），退出码 0
 - [ ] **单条最小流水**：`test_conversation_fold_then_run_then_backfill` —— 折叠流式工具调用 → runner 真读 tmp_path 文件 → 结果回灌历史（该用例断言磁盘文件确实被读到、tool_use_id 配对正确）
+
+---
+
+# MewCode — checklist.md（ch05 验收表 · 指令工程 + 缓存）
+
+> 测试载体：`tests/test_ch05_prompts.py` + `tests/test_ch05.py`。
+
+## 指令模块化与装配（想法#1）
+- [ ] `prompts.DEFAULT_MODULES` 的模块 `key` 唯一；`build_system_prompt()` 按 `priority` 升序拼装（identity 在 tool_discipline 前）
+- [ ] 同进程内两次装配结果**逐字节相同** → 稳定 system 才能当缓存前缀
+
+## 稳定/易变分流（想法#2、#3）
+- [ ] 稳定 system **不含**任何易变词（cwd / 路径分隔符 / 时间 / git）——测试 `test_system_prompt_is_stable_no_env_leak` 盯着
+- [ ] `collect_env()` 一定含绝对 cwd；git 探测失败/无 git 时不抛异常（吞掉）
+- [ ] Agent 注入 env 时：env 作为首条临时 user 消息发出，**不写回 `cm` 历史**（env 不污染正式历史、不碰缓存前缀）
+
+## 缓存断点（想法#2 落地，anthropic）
+- [ ] `prompt_caching` 默认关：anthropic `body["system"]` 仍是纯字符串、tools 不加断点 → ch02 精确相等断言不回归
+- [ ] `prompt_caching: true` 时 anthropic：system 变带 `cache_control:{type:"ephemeral"}` 的文本块；**末个**工具带断点；传入的 tools dict 不被污染（浅拷贝）
+- [ ] openai 后端忽略缓存 flag：`instructions` 仍是纯字符串，tools 无 cache_control
+
+## 缓存计量（想法#7）
+- [ ] `StreamEnd` 新增 `cache_read_input_tokens` / `cache_creation_input_tokens`，默认 0（不破旧测试）
+- [ ] anthropic 从 `message_start`/`message_delta` 的 usage 回填两字段；openai 保持默认 0
+- [ ] cli 在缓存字段非 0 时打印 `[cache] 读 X tok / 写 Y tok`
+
+## 端到端验收（至少一条）
+- [ ] **全量测试**：`python -m pytest` 全部通过（旧 36 + 新 14 = 50），退出码 0
+- [ ] **人工 live（需真实 anthropic key，定性验证缓存真命中）**：`mewcode.yaml` 设 `protocol: anthropic` + `prompt_caching: true`，`python -m mewcode`。第一轮任意提问：应见 `[cache] 写 >0`（写缓存）；第二轮再问（同样 system+tools 前缀）：应见 `[cache] 读 >0`（命中缓存）。若始终只有"写"没有"读"，说明稳定前缀里有东西在变（如 env 误入 system），回头查
