@@ -11,6 +11,13 @@ thinking: true          # 开启 Claude 的 extended thinking
 thinking_budget: 1024
 prompt_caching: true    # ch05：开启 prompt 缓存(稳定 system+工具前缀被缓存，省重复 token)
 
+# --- ch06：安全检查(三段都可省略，省略即"默认档 + 只允许项目根 + 内置黑名单") ---
+permission_mode: default   # strict(没显式放行就问) / default(沙箱内放行) / permissive(只留黑名单)
+sandbox_roots: []          # 允许读写的目录列表；留空 = 只允许启动时所在的项目根
+extra_deny_patterns: []    # 追加的危险命令黑名单(正则)；只能加严，删不掉内置的那些
+# 例：sandbox_roots: ["D:/Project/my_code", "D:/shared"]
+# 例：extra_deny_patterns: ["\\bgit\\s+push\\s+--force\\b"]
+
 # --- 或 OpenAI ---
 # protocol: openai
 # model: gpt-4o-mini

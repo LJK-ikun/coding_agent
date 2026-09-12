@@ -30,11 +30,15 @@
     max_output_tokens: int      # 每轮回复的 token 上限
     thinking: bool              # 是否请求 extended thinking（anthropic）
     thinking_budget: int        # thinking 的 token 预算
+    prompt_caching: bool        # 是否给稳定前缀打 prompt 缓存断点（ch05）
+    permission_mode: str        # 权限档位 strict/default/permissive（ch06）
+    sandbox_roots: [str]        # 路径沙箱允许的目录，留空 = 只允许项目根（ch06）
+    extra_deny_patterns: [str]  # 追加的危险命令黑名单（正则，只能加严）（ch06）
 """
 
 from __future__ import annotations  # 让"类型注解"能用更简洁的写法（旧 Python 也兼容）
 
-from dataclasses import dataclass  # 导入 dataclass：省事造"纯数据盒子"的工具
+from dataclasses import dataclass, field  # dataclass 造盒子；field 给 list 格子兜默认空表
 from pathlib import Path  # 导入 Path：把路径文字变成能 .exists()/.read_text() 的对象
 
 import yaml  # 导入 yaml：能把 .yaml 文本解析成 Python 的字典(dict)
@@ -68,6 +72,14 @@ class ProviderConfig:
     # 格子8: 是否开启 prompt 缓存(ch05)。默认关，保持旧行为不变；anthropic 开它后
     #       会在稳定 system + 工具列表上加缓存断点，让每轮重复的前缀只付一次费。
     prompt_caching: bool = False
+    # ↓↓ ch06：权限门卫的四个格子。都不填也能跑（走"默认档 + 项目根沙箱"）↓↓
+    # 格子9: 权限档位。strict=没显式放行的都问 / default=沙箱内放行、沙箱外问 /
+    #        permissive=只留黑名单。命令行 --mode 可临时覆盖它。
+    permission_mode: str = "default"
+    # 格子10: 路径沙箱允许的目录列表。留空 = 只允许启动时所在的项目根。
+    sandbox_roots: list = field(default_factory=list)
+    # 格子11: 追加的危险命令黑名单（正则）。只能"更加严"，删不掉内置的那些。
+    extra_deny_patterns: list = field(default_factory=list)
 
     def resolved_base_url(self) -> str:  # 技能①：算出"最后真正去请求的网址"
         """返回实际请求地址：base_url 为空时用厂商默认值，再去掉末尾斜杠。"""
@@ -86,6 +98,25 @@ class ProviderConfig:
             raise ValueError("config missing required field: model")  # 报：缺 model
         if not self.api_key:  # 如果 key 是空
             raise ValueError("config missing required field: api_key")  # 报：缺 key
+        # ch06：档位写错时立刻报，别等门卫那边悄悄回落到默认档——
+        # "我明明设了 permissive 怎么还在问我" 这种问题最难查。
+        from .tools.permission import MODES  # 就地 import：避免 tools 包与配置层互相牵扯
+
+        if self.permission_mode not in MODES:
+            raise ValueError(
+                f"permission_mode '{self.permission_mode}' unsupported; use one of {MODES}"
+            )
+
+
+def _as_str_list(value: object) -> list:  # 小帮手：把 YAML 里一串东西收成"字符串列表"
+    """把 YAML 读出来的值（可能是 None / 单个字符串 / 列表）统一成字符串列表。"""
+    if value is None:  # 没写这一项
+        return []
+    if isinstance(value, str):  # 只写了一个字符串，也当成长度 1 的列表
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):  # 正常情况：YAML 列表
+        return [str(v) for v in value if str(v).strip()]
+    return []  # 写成了别的类型（比如数字）：当作没写
 
 
 def load_config(path: str | Path) -> ProviderConfig:  # 读取器：给路径，返回填满的盒子
@@ -106,6 +137,11 @@ def load_config(path: str | Path) -> ProviderConfig:  # 读取器：给路径，
         thinking=bool(raw.get("thinking", False)),  # 取思考开关；转成 bool；默认关
         thinking_budget=int(raw.get("thinking_budget", 1024)),  # 取思考预算；转 int；默认 1024
         prompt_caching=bool(raw.get("prompt_caching", False)),  # 取缓存开关(ch05)；默认关
+        permission_mode=str(raw.get("permission_mode", "default")).strip().lower(),  # ch06 档位
+        # ch06 沙箱目录：YAML 里给一串路径；不是列表就兜成空（= 只允许项目根）。
+        sandbox_roots=_as_str_list(raw.get("sandbox_roots")),
+        # ch06 追加黑名单：一串正则字符串，只能加严不能放松。
+        extra_deny_patterns=_as_str_list(raw.get("extra_deny_patterns")),
     )
     cfg.validate()  # 填完调 validate 做最后检查（漏了 key 之类在这报）
     return cfg  # 检查通过，把填好的盒子交出去，给后面的 client 用

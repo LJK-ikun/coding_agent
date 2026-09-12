@@ -30,11 +30,59 @@ from .config import ProviderConfig, load_config
 from .conversation import ConversationManager
 from .errors import LLMError, RateLimitError
 from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 system + 取环境
-from .tools import build_default_registry  # ch04：Agent 内部自己造 ToolRunner
+from .tools import build_default_registry, ToolRunner  # ch04/ch06：注册中心 + 执行器
 from .tools.base import StreamEnd, TextDelta, ThinkingDelta
+from .tools.permission import (  # ch06：权限门卫 + HITL 的四种答复
+    GRANT_ALWAYS,
+    GRANT_DENY,
+    GRANT_ONCE,
+    GRANT_SESSION,
+    MODES,
+    PermissionEngine,
+    PermissionRequest,
+)
 
 _DIM = "\x1b[2m"  # ANSI转义码： 暗色文本
 _RESET = "\x1b[0m"  # ANSI转义码： 回复终端默认颜色
+_YELLOW = "\x1b[33m"  # ANSI转义码： 黄色（用于权限确认这类"要你拿主意"的提示）
+
+
+# =============================================================
+# 人在回路（HITL）：规则没给出明确结论时，把决定权交回用户
+# =============================================================
+
+#: 问用户时的四个选项。特意把"允许的范围"写清楚——用户是在**看见自己
+#: 要授出多大权限**的前提下做选择的，而不是盲点一个 yes。
+_ASK_MENU = (
+    "  1) 本次允许（就这一下）\n"
+    "  2) 本会话允许（这个进程内都算数，退出即失效）\n"
+    "  3) 永久允许（写进项目规则文件，下次启动还在）\n"
+    "  4) 拒绝（不执行，并把这个决定告诉模型）\n"
+)
+
+#: 选项 1/2/3 分别对应哪种授权范围；4 和任何非法输入都落到"拒绝"。
+_ASK_CHOICES = {"1": GRANT_ONCE, "2": GRANT_SESSION, "3": GRANT_ALWAYS}
+
+
+async def _ask_permission(req: PermissionRequest) -> str:
+    """门卫判成 ask 时，Runner 会 await 到这个函数——这就是"问用户"本身。
+
+    ★ 为什么用 ``asyncio.to_thread(input, ...)``？
+    因为 ``input()`` 是阻塞的，直接调会把整条事件循环卡死（模型那边还在流式
+    吐字，界面就僵住了）。丢到线程里读键盘，主循环照常转。
+    """
+    print(f"\n{_YELLOW}[权限确认]{_RESET}")
+    print(req.describe())  # 工具 / 命令或路径 / 为什么被拦下来
+    print(f"  当前档位: {req.mode}")
+    # 把"允许之后会记下什么规则"明明白白摆出来——透明是这类授权的前提
+    print(f"  若允许，将记下规则: {req.tool}  {req.suggest_match()}  -> allow")
+    print(_ASK_MENU, end="")  # end="" 让光标停在选项后面
+    try:
+        answer = (await asyncio.to_thread(input, "选择 [1/2/3/4]（直接回车 = 拒绝）: ")).strip()
+    except (EOFError, KeyboardInterrupt):  # Ctrl+C / Ctrl+D 一律当拒绝
+        print()
+        return GRANT_DENY
+    return _ASK_CHOICES.get(answer, GRANT_DENY)  # 乱敲 = 拒绝（fail-closed）
 
 
 def _print_assistant_text(chunk: str) -> None:
@@ -92,16 +140,32 @@ async def _run_agent_turn(
 # 主聊天循环 async
 # 整体功能
 # 初始化客户端/工具环境 -> 进入无限聊天循环 -> 读取用户输入 -> 处理内置命令 
-async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False) -> int:
+async def run(
+    cfg: ProviderConfig,
+    system: str = "",
+    show_thinking: bool = False,
+    mode: str | None = None,  # ch06：命令行 --mode 覆盖 YAML 里的档位
+) -> int:
     client = create_client(cfg)
     cm = ConversationManager()
     # ch04：造一张登记中心，再让 Agent 包住 client + registry 去自动反复动手。
     # 工作根默认取启动终端所在目录，六个工具的相对路径都从它解析。
     registry = build_default_registry(base_dir=os.getcwd())
-    agent = Agent(client=client, registry=registry)
+    # ch06：造权限门卫，再把它挂进 runner——门卫的落点就在"真执行之前"这一步。
+    # 工作根同时是沙箱的默认唯一根：工具能读到哪、写到哪，默认就是启动目录这一片。
+    engine = PermissionEngine(
+        mode=mode or cfg.permission_mode,
+        base_dir=os.getcwd(),
+        roots=cfg.sandbox_roots or None,  # YAML 没写 → 只允许项目根
+        deny_patterns=cfg.extra_deny_patterns or None,  # 用户追加的黑名单
+    )
+    runner = ToolRunner(registry, guard=engine, ask=_ask_permission)
+    agent = Agent(client=client, registry=registry, runner=runner)
     print(f"MewCode  |  protocol={cfg.protocol}  model={cfg.model}")
     print(f"tools: {', '.join(registry.names())}")  # 提醒用户模型手上有哪些工具
-    print("Type a message, or /exit /clear /model.  Ctrl+C aborts the current reply.\n")
+    # ch06：把"当前护栏有多紧"亮在启动第一屏——用户得知道自己正处在什么档位下
+    print(f"权限: mode={engine.mode}  沙箱根={', '.join(engine.roots)}")
+    print("Type a message, or /exit /clear /model /mode /permissions.  Ctrl+C aborts.\n")
 
     while True:
         try:
@@ -133,6 +197,23 @@ async def run(cfg: ProviderConfig, system: str = "", show_thinking: bool = False
         # /clear 调用对话管理器，清空全部聊天历史；continue回到循环开头等待输入
         if text == "/model":
             print(f"protocol={cfg.protocol}  model={cfg.model}")
+            continue
+        # ch06：/mode 查看或切换权限档位。切换是**运行时**的——门卫读的是 engine.mode，
+        # 改一个字段即刻生效，不用重启进程（档位是第 1 层，压在最底下当兜底）。
+        if text == "/mode" or text.startswith("/mode "):
+            want = text[len("/mode") :].strip()
+            if not want:  # 只敲 /mode：报当前档位 + 可选值
+                print(f"当前档位: {engine.mode}    可选: {' / '.join(MODES)}")
+            elif want not in MODES:  # 写了不认识的档位
+                print(f"未知档位 {want!r}，可选: {' / '.join(MODES)}")
+            else:
+                engine.mode = want
+                print(f"档位已切到: {engine.mode}")
+            continue
+        # ch06：/permissions 把当前生效的护栏整体摊开——档位、沙箱、黑名单条数、
+        # 以及三层规则各自是什么（含本会话临时授权的那几条，看得到才放心）。
+        if text == "/permissions":
+            print(engine.describe())
             continue
 
         # /model打印当前使用的协议，模型名称
@@ -174,6 +255,13 @@ def main(argv: list[str] | None = None) -> int:
         help="可选的系统提示词。缺省时用内置模块(ch05 build_system_prompt)自动装配",
     )
     ap.add_argument("--show-thinking", action="store_true", help="同时打印模型的思考/推理过程")
+    # ch06：一次性覆盖 YAML 里的权限档位（比如这次只想小心行事：--mode strict）
+    ap.add_argument(
+        "--mode",
+        choices=MODES,
+        default=None,
+        help="权限档位：strict(没显式放行就问) / default(沙箱内放行) / permissive(只留黑名单)",
+    )
     args = ap.parse_args(argv)
     # 把标准输入输出都强制成 UTF-8：否则在 GBK 控制台/管道里，中文输入会被按
     # cp936 读成乱码（进而模型 echo 乱码产生孤立代理字符），中文回复也打不全。
@@ -192,7 +280,12 @@ def main(argv: list[str] | None = None) -> int:
         # 传了 --system 就用它，否则用内置模块按优先级拼装。
         stable_system = args.system if args.system else build_system_prompt()
         return asyncio.run(
-            run(cfg, system=stable_system, show_thinking=args.show_thinking)
+            run(
+                cfg,
+                system=stable_system,
+                show_thinking=args.show_thinking,
+                mode=args.mode,  # 命令行没给就是 None，run 里回落到 cfg.permission_mode
+            )
         )
     except KeyboardInterrupt:
         return 130

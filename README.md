@@ -2,7 +2,7 @@
 
 一个跑在终端的 **AI CodingAgent** 框架(Python 实现)。目标是让模型不只"会说话",还能真正**动手**:读文件、写文件、改文件、执行命令、找文件、搜代码——像一个能替你干活的 agent。
 
-当前进度:**ch05 指令工程(模块化 system + 环境分流 + prompt 缓存)**。
+当前进度:**ch06 纵深防御的安全检查(黑名单 / 路径沙箱 / 规则 / 多档模式 / 人在回路)**。
 
 ## 它能做什么
 
@@ -35,6 +35,35 @@
 
 所有工具都遵循同一套纪律:**返回统一的"成功/失败收据",失败不抛异常而是把原因还给模型让它重试**;相对路径一律基于工作根目录解析;重活放进线程不阻塞流式回复。
 
+## 安全检查(ch06)
+
+模型会幻觉、用户会手滑,所以在"真执行"之前有一道门卫,按**六层纵深防御**逐层过一遍:
+
+| 层 | 做什么 | 不通过时 |
+|---|---|---|
+| 1 档位模式 | `strict` / `default` / `permissive` 定基调 | 兜底决定 |
+| 2 危险操作黑名单 | `rm -rf /`、`curl … \| bash`、fork 炸弹… | 直接拒绝(硬底线,任何档位都拦) |
+| 3 路径沙箱 | 读/写/改/找/搜 + `run_command` 的 `cwd` 只能落在允许目录内 | 交给用户 |
+| 4 显式规则 | `工具 + 参数/路径模式 → allow/deny/ask` | 按规则执行 |
+| 5 人在回路 | 前几层没结论时问用户 | 本次/本会话/永久允许 或 拒绝 |
+| 6 规则优先级 | 会话级 > 项目级 > 用户全局 | 贯穿 3、4 层 |
+
+被拦下**不会中断整轮**:而是回一条失败结果告诉模型"被哪条规则拒了",让它能改道把活干完。
+
+规则写在 `.mewcode/permissions.yaml`(项目级)或 `~/.mewcode/permissions.yaml`(用户全局):
+
+```yaml
+rules:
+  - tool: run_command
+    match: "git status*"   # glob;需要正则时写 "re:^git\\s+push"
+    action: allow          # allow | deny | ask
+  - tool: write_file
+    match: "**/*.env"
+    action: deny
+```
+
+> 诚实的边界:黑名单是**网**不是**墙**。它会剥引号、拆 shell 链、压空白来挡低成本变形,但**不承诺对抗刻意规避**。它的价值在于兜住模型幻觉与用户手滑,而不是对抗一个决意作恶的对手。
+
 ## 怎么装
 
 需要 Python ≥ 3.10。安装时可选带测试依赖:
@@ -63,6 +92,11 @@ api_key: sk-ant-...
 thinking: true        # 开启 extended thinking
 prompt_caching: true  # ch05: 缓存稳定 system+工具前缀,省重复 token(anthropic 专属)
 
+# ch06: 安全检查(都可省略,省略即走"默认档 + 项目根沙箱 + 内置黑名单")
+permission_mode: default   # strict | default | permissive
+sandbox_roots: []          # 留空 = 只允许启动时所在的项目根
+extra_deny_patterns: []    # 追加的危险命令黑名单(正则,只能加严)
+
 # --- 或 OpenAI(二者选一,注释掉另一份)---
 # protocol: openai
 # model: gpt-4o-mini
@@ -74,14 +108,16 @@ prompt_caching: true  # ch05: 缓存稳定 system+工具前缀,省重复 token(a
 ```bash
 python -m mewcode                 # 或装好后直接: mewcode
 python -m mewcode mewcode.yaml --show-thinking
+python -m mewcode --mode strict   # ch06: 这次只想小心行事
 ```
 
-终端内命令:`/exit` `/quit` 退出 · `/clear` 清空历史 · `/model` 查看当前模型。
+终端内命令:`/exit` `/quit` 退出 · `/clear` 清空历史 · `/model` 查看当前模型 ·
+`/mode [档位]` 查看或切换权限档位 · `/permissions` 摊开当前生效的护栏。
 
 ## 怎么测
 
 ```bash
-python -m pytest          # 50 条用例:传输层 17 + 工具系统 16 + ch04 Agent 若干 + ch05 指令工程 14
+python -m pytest          # 109 条用例:传输层 17 + 工具系统 16 + ch04 Agent 若干 + ch05 指令工程 14 + ch06 安全检查 59
 ```
 
 ## 项目结构
@@ -94,13 +130,14 @@ mewcode/
 ├── conversation.py   # 对话历史:折叠流式工具调用、回灌工具结果
 ├── agent.py          # AgentLoop:调模型→跑工具→回灌,自动反复动手
 ├── models.py         # 统一消息模型(ToolUse / ToolCallResult)
-├── config.py         # YAML 配置层(含 prompt_caching 开关)
+├── config.py         # YAML 配置层(含 prompt_caching、权限档位/沙箱/黑名单)
 └── tools/
     ├── interface.py  # 地基:ToolResult(收据)+ Tool(统一接口)
     ├── core.py       # 六个核心工具
     ├── base.py       # 流式事件(TextDelta / ToolCall* / StreamEnd 含缓存计量)
     ├── registry.py   # 注册中心:名字 → 工具
-    └── runner.py     # 执行器:查表 / 套超时 / 兜错
+    ├── permission.py # ch06:权限门卫——六层纵深防御的判定(只判不问)
+    └── runner.py     # 执行器:查表 → 过门卫 → 套超时 → 兜错
 ```
 
 ## 分层路线图
@@ -108,10 +145,12 @@ mewcode/
 - **ch01** 配置层 · **ch02** LLM 传输层(让 AI 开口,流式 + thinking + 双厂商)
 - **ch03** 工具系统:让模型能动手——单发工具循环
 - **ch04** AgentLoop:多轮自动循环(拿结果反复动手)
-- **ch05** 指令工程(本版):模块化 system + 环境分流 + prompt 缓存
-- 后续规划:上下文 Compact、SubAgent / Skill / Team 编排、运行时指令注入、工具执行前的确认门卫
+- **ch05** 指令工程:模块化 system + 环境分流 + prompt 缓存
+- **ch06** 安全检查(本版):黑名单 + 路径沙箱 + 规则 + 多档模式 + 人在回路
+- 后续规划:上下文 Compact、SubAgent / Skill / Team 编排、运行时指令注入、审计日志
 
 ## 明确不做(当前范围外)
 
-- 多轮自动循环(拿到一次工具结果就停,自动追问归下一章)
-- 命令执行前的用户确认门卫(模型想跑就跑,安全性取舍留待后续)
+- 对抗刻意规避(不做 shell 语法树解析、不做 base64/变量拼接还原)
+- 进程级隔离(容器 / namespace / 只读挂载)——本章是应用层判定,不是内核级隔离
+- 每次决策的审计日志(留痕归后续章节)
