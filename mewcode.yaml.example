@@ -18,6 +18,24 @@ extra_deny_patterns: []    # 追加的危险命令黑名单(正则)；只能加�
 # 例：sandbox_roots: ["D:/Project/my_code", "D:/shared"]
 # 例：extra_deny_patterns: ["\\bgit\\s+push\\s+--force\\b"]
 
+# --- ch07：MCP server(可省略，省略即不接任何远端工具) ---
+# 接进来的工具名会是 mcp__<name>__<工具名>，跟本地工具一样受权限门卫管。
+# 一个 server 连不上只会被跳过并记一笔，不影响本地工具和其他 server。
+mcp_servers: []
+# 例(stdio 连法：我们把它当子进程拉起来)：
+# mcp_servers:
+#   - name: filesystem
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#     env: {}                  # 额外环境变量
+#     cwd: ""                  # 子在哪个目录跑；留空 = 跟着 MewCode
+#     enabled: true            # 写 false 临时停用
+# 例(http 连法：直接往地址发请求)：
+#   - name: remote
+#     url: https://example.com/mcp
+#     headers: {Authorization: "Bearer xxx"}
+#     timeout: 60              # 单请求超时秒数
+
 # --- 或 OpenAI ---
 # protocol: openai
 # model: gpt-4o-mini

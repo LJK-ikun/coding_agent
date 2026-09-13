@@ -29,6 +29,7 @@ from .client import create_client
 from .config import ProviderConfig, load_config
 from .conversation import ConversationManager
 from .errors import LLMError, RateLimitError
+from .mcp.manager import McpManager  # ch07：MCP 连接池（一批远端 server 的管家）
 from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 system + 取环境
 from .tools import build_default_registry, ToolRunner  # ch04/ch06：注册中心 + 执行器
 from .tools.base import StreamEnd, TextDelta, ThinkingDelta
@@ -161,8 +162,20 @@ async def run(
     )
     runner = ToolRunner(registry, guard=engine, ask=_ask_permission)
     agent = Agent(client=client, registry=registry, runner=runner)
+    # ch07：把配置里的 MCP server 全连上，收到的远端工具并肩装进同一张注册中心。
+    # ★ 顺序有讲究：必须在 agent 造好之前装完，否则工具清单进了提示词却对不上。
+    # ★ connect 是尽力而为的：某个 server 连不上只记进 mcp.errors，不拦启动。
+    mcp = McpManager(cfg.mcp_servers)
+    await mcp.start()
+    mcp_added, mcp_skipped = mcp.register_into(registry)
     print(f"MewCode  |  protocol={cfg.protocol}  model={cfg.model}")
     print(f"tools: {', '.join(registry.names())}")  # 提醒用户模型手上有哪些工具
+    if mcp.servers:  # 连上的 server 报个数，让用户知道远端那半边是活的
+        print(f"mcp: 已连接 {len(mcp.servers)} 个 server（{', '.join(mcp.servers)}），新增 {mcp_added} 个工具")
+    if mcp_skipped:  # 撞名被跳过：必须说，不然用户会以为工具凭空少了
+        print(f"mcp: {mcp_skipped} 个工具因重名跳过（本地工具优先，未被覆盖）")
+    for name, err in mcp.errors.items():  # 连不上的：如实报出来，但不影响使用
+        print(f"mcp: server {name!r} 未连接 — {err}")
     # ch06：把"当前护栏有多紧"亮在启动第一屏——用户得知道自己正处在什么档位下
     print(f"权限: mode={engine.mode}  沙箱根={', '.join(engine.roots)}")
     print("Type a message, or /exit /clear /model /mode /permissions.  Ctrl+C aborts.\n")
@@ -243,6 +256,9 @@ async def run(
             if os.environ.get("MEW_DEBUG"):  # os 已在本模块顶部 import，此处直接用
                 raise
             print(f"\n[error] {exc}")
+    # ch07：收摊。所有正常退出路径（/exit、Ctrl+D）都汇到这里。
+    # 关闭本身带幂等 + 超时兜底，某个 server 赖着不走也不会卡住退出。
+    await mcp.close()
     return 0
 
 

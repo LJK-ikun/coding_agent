@@ -2,7 +2,7 @@
 
 一个跑在终端的 **AI CodingAgent** 框架(Python 实现)。目标是让模型不只"会说话",还能真正**动手**:读文件、写文件、改文件、执行命令、找文件、搜代码——像一个能替你干活的 agent。
 
-当前进度:**ch06 纵深防御的安全检查(黑名单 / 路径沙箱 / 规则 / 多档模式 / 人在回路)**。
+当前进度:**ch07 MCP 客户端(接外部 MCP server,把远端工具当本地工具用)**。
 
 ## 它能做什么
 
@@ -64,6 +64,35 @@ rules:
 
 > 诚实的边界:黑名单是**网**不是**墙**。它会剥引号、拆 shell 链、压空白来挡低成本变形,但**不承诺对抗刻意规避**。它的价值在于兜住模型幻觉与用户手滑,而不是对抗一个决意作恶的对手。
 
+## 接入 MCP(ch07)
+
+[MCP(Model Context Protocol)](https://modelcontextprotocol.io) 是"让 AI 接外部工具"的通用协议。这一章实现**客户端**那一半:把任意 MCP server 提供的工具,接进来当本地工具用。
+
+对模型来说,**远端工具和本地工具没有任何区别**——同样出现在工具清单里、同样受权限门卫管、同样回灌进对话历史。差别只在名字:
+
+```
+mcp__<server>__<工具名>      例:mcp__filesystem__read_file
+```
+
+加前缀是因为名字是全局唯一的 key:本地已经有 `read_file` 了,两个 server 也可能各有一个 `search`。不加前缀就会**静默互相覆盖**,这种 bug 极难查。
+
+分层设计,每层只管一件事:
+
+| 文件 | 职责 |
+|---|---|
+| `protocol.py` | 报文长什么样(JSON-RPC 2.0 编解码 + 分类) |
+| `transport.py` | 怎么送出去(stdio 子进程 / streamable HTTP + SSE) |
+| `session.py` | 谁问的谁答的(id 配对、超时清理、握手) |
+| `adapter.py` | 远端工具 → 本地 `Tool`(加前缀、content 拍平成文字) |
+| `manager.py` | 一批 server 的管家(并发连、收工具、并发关) |
+
+两条贯穿全程的纪律:
+
+- **一个 server 连不上,不拖垮其他的。** 配错一个 server 只会记进 `errors` 并跳过,CLI 照常起来、本地工具照常用。为了一个配错的远端工具赔上整个程序,代价不成比例。
+- **失败是收据,不是异常。** 对端回 `isError`、连接断掉、超时——统统翻成失败收据喂回模型,让它读着改,而不是把整轮对话打断。
+
+> 诚实的边界:本章是**客户端**,不做 server。HTTP 那条路只有单元测试覆盖(SSE 解析、批量 JSON),没对着真实远端 server 跑过完整链路;stdio 那条有真子进程的端到端测试。
+
 ## 怎么装
 
 需要 Python ≥ 3.10。安装时可选带测试依赖:
@@ -97,6 +126,18 @@ permission_mode: default   # strict | default | permissive
 sandbox_roots: []          # 留空 = 只允许启动时所在的项目根
 extra_deny_patterns: []    # 追加的危险命令黑名单(正则,只能加严)
 
+# ch07: 接外部 MCP server(可省略,省略即不接任何远端工具)
+mcp_servers:
+  - name: filesystem            # 本地代号;工具名会是 mcp__filesystem__xxx
+    command: npx                # stdio 连法:要跑的可执行文件
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    env: {}                     # 额外环境变量(可选)
+    enabled: true               # 临时停用写 false(可选)
+  - name: remote                # http 连法:直接给地址
+    url: https://example.com/mcp
+    headers: {Authorization: "Bearer ..."}   # 可选
+    timeout: 60                 # 单请求超时秒数(可选)
+
 # --- 或 OpenAI(二者选一,注释掉另一份)---
 # protocol: openai
 # model: gpt-4o-mini
@@ -117,8 +158,10 @@ python -m mewcode --mode strict   # ch06: 这次只想小心行事
 ## 怎么测
 
 ```bash
-python -m pytest          # 109 条用例:传输层 17 + 工具系统 16 + ch04 Agent 若干 + ch05 指令工程 14 + ch06 安全检查 59
+python -m pytest          # 181 条用例:LLM 传输层 17 + 工具系统 16 + ch04 Agent 3 + ch05 指令工程 14 + ch06 安全检查 59 + ch07 MCP 72
 ```
+
+ch07 那 72 条里,**70 条完全离线**(传输层用假 Transport 顶着,不起进程不联网),只有 T6 那 2 条真拉子进程跑端到端。
 
 ## 项目结构
 
@@ -138,6 +181,12 @@ mewcode/
     ├── registry.py   # 注册中心:名字 → 工具
     ├── permission.py # ch06:权限门卫——六层纵深防御的判定(只判不问)
     └── runner.py     # 执行器:查表 → 过门卫 → 套超时 → 兜错
+└── mcp/              # ch07:MCP 客户端,四层各管一件事
+    ├── protocol.py   # 报文层:JSON-RPC 2.0 编解码 + 请求/响应/通知分类
+    ├── transport.py  # 传输层:stdio 子进程 / streamable HTTP(+SSE 解析)
+    ├── session.py    # 会话层:握手 + id 配对 + 超时清理
+    ├── adapter.py    # 适配层:远端工具 → 本地 Tool(加前缀、content 拍平)
+    └── manager.py    # 连接池:一批 server 并发连/收工具/并发关
 ```
 
 ## 分层路线图
@@ -146,7 +195,8 @@ mewcode/
 - **ch03** 工具系统:让模型能动手——单发工具循环
 - **ch04** AgentLoop:多轮自动循环(拿结果反复动手)
 - **ch05** 指令工程:模块化 system + 环境分流 + prompt 缓存
-- **ch06** 安全检查(本版):黑名单 + 路径沙箱 + 规则 + 多档模式 + 人在回路
+- **ch06** 安全检查:黑名单 + 路径沙箱 + 规则 + 多档模式 + 人在回路
+- **ch07** MCP 客户端(本版):协议 / 传输 / 会话 / 适配 / 连接池,接外部工具进来当本地用
 - 后续规划:上下文 Compact、SubAgent / Skill / Team 编排、运行时指令注入、审计日志
 
 ## 明确不做(当前范围外)
