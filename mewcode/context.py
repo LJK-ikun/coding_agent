@@ -25,7 +25,10 @@ from __future__ import annotations  # 注解延迟求值
 import json  # 把工具参数（字典）转回 JSON 字符串，好按"模型看到的形态"量它
 from pathlib import Path  # 把目录路径变成能 .mkdir() / 拼接的对象
 
-from .models import Message  # 对话层统一的消息盒子（本文件只读它，不反向依赖，不会循环 import）
+from .models import (  # 对话层统一的消息盒子（本文件只读它，不反向依赖，不会循环 import）
+    ROLE_USER,
+    Message,
+)
 
 # ----------------------------------------------------------------------------------
 # 估算系数（经验值）
@@ -167,3 +170,101 @@ def shrink_large_results(
             shrunk += 1  # 记一笔
 
     return shrunk  # 报数：这次挪走了几条
+
+
+# ----------------------------------------------------------------------------------
+# 第 2 层压缩（上半）：把历史渲染成人能读的纯文本
+# ----------------------------------------------------------------------------------
+# 摘要要让 LLM 来写，可 LLM 收到的是"文本"，不是我们的 Message 对象。所以先得把
+# 一串 Message 摊平成一份"对话记录"，像剧本一样：
+#
+#     [用户] 帮我改 test.py
+#     [助手] 我先看看这文件
+#     [助手·调用] read_file({"path": "test.py"})
+#     [工具·结果] 1: import os ...
+#
+# ★ 为什么每个格子都要摊出来？因为摘要 LLM 只能看见我们给它的东西。漏了
+#   tool_uses，它就不知道"改过哪些文件"；漏了 tool_results，它就不知道
+#   "上次跑测试报了什么错"。摊全了，写出来的纪要才接得上后面的活。
+
+
+def render_transcript(messages: list[Message]) -> str:
+    """把一段历史摊平成纯文本，供摘要 LLM 阅读。
+
+    每行一个格子，格式 ``[身份·格子] 内容``。一条消息有多个格子就占多行。
+    """
+    lines: list[str] = []  # 攒每一行
+
+    for m in messages:  # 逐条消息
+        who = "用户" if m.role == ROLE_USER else "助手"  # 谁说的
+
+        if m.thinking:  # 思考（可空）
+            lines.append(f"[{who}·思考] {m.thinking}")
+
+        if m.content:  # 说的话（工具结果那条消息这里通常是空的）
+            lines.append(f"[{who}] {m.content}")
+
+        for tu in m.tool_uses:  # 助手说"我要调哪个工具"
+            args = json.dumps(tu.input, ensure_ascii=False)  # 参数字典转成 JSON 字符串
+            lines.append(f"[{who}·调用 {tu.name}] {args}")
+
+        for tr in m.tool_results:  # 工具搬回来的结果
+            mark = "失败" if tr.is_error else "结果"  # 失败的单独标出来，免得摘要把报错当成产出
+            lines.append(f"[工具·{mark}] {tr.content}")
+
+    return "\n".join(lines)  # 一行一行接起来
+
+
+# ----------------------------------------------------------------------------------
+# 第 2 层压缩（下半）：找一个"切不出孤儿工具结果"的切点
+# ----------------------------------------------------------------------------------
+# 压缩要把历史切成两段：前面那段拿去写摘要，后面那段原样保留。看着简单，但协议
+# 有个硬规矩——助手说"我要调 read_file（id=t1）"，那么紧跟着的 user 消息里**必须**
+# 有 t1 的结果。成对，不能拆散。
+#
+#     索引:  0            1              2            3
+#           [用户:改文件] [助手:调 read(t1)] [用户:结果(t1)] [助手:改好了]
+#                            ↑ 从这切，调用和结果都在尾巴里，成对 ✓
+#                                               ↑ 从这切，调用被切走只剩结果 ✗
+#                                                  Anthropic 报 unexpected tool_result
+#
+# 所以裁的时候不能让切点落在"结果"上：得往后挪，挪到那儿为止。
+
+
+def safe_cut_index(messages: list[Message], start: int) -> int:
+    """从 ``start`` 往后挪，找到第一个"不会切出孤儿工具结果"的位置。
+
+    "孤儿"指的是：带着工具结果、但它的调用却留在了被摘要的那边的消息。判据很
+    简单——一条 user 消息只要携带 tool_results，就说明它前面必定有个 assistant
+    的调用。于是这种消息**不能当尾巴的开头**，跳过它往后继续找。
+
+    返回修正后的下标。若一直挪到末尾都找不到（极端情况），返回 ``len(messages)``
+    —— 表示"没东西可留"，由调用方决定怎么办（通常是这次先不压缩）。
+    """
+    i = max(0, start)  # 负数当下标会从末尾倒数，先夹到 0
+    while i < len(messages):  # 一路往后找
+        m = messages[i]
+        if m.role == ROLE_USER and m.tool_results:  # 这是"某次调用的结果"
+            i += 1  # 它的调用大概率在头部 → 会变孤儿 → 跳过
+            continue
+        break  # 不是结果消息（助手说的 / 用户说的话）→ 这里就是干净切点
+    return i
+
+
+def keep_start_index(messages: list[Message], keep_tokens: int) -> int:
+    """从末尾往前数，攒够 ``keep_tokens`` 就停下——这里就是"保留段"的开头。
+
+    例：``keep_tokens`` = 38400 时，从最后一条往回数，数到累计 38400 token
+    就停，返回那个下标。它前面的全是要被摘要掉的。
+
+    ★ 为什么从后往前数？因为"保留最近的一段"天然是从屁股那头算起的。正着数
+    得先知道总长，还得再减一次——倒着数一步到位。
+    """
+    if keep_tokens <= 0:  # 不保留任何东西
+        return len(messages)  # 尾巴从末尾开始（= 空）
+    used = 0  # 已经数进来多少 token
+    for i in range(len(messages) - 1, -1, -1):  # 从最后一条倒着走
+        used += estimate_messages_tokens([messages[i]])  # 把这条算上
+        if used > keep_tokens:  # 加上这条就超预算了
+            return i + 1  # 那它不进来，尾巴从它的下一条开始
+    return 0  # 全数完还没超 → 整段都留着
