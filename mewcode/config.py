@@ -34,6 +34,11 @@
     permission_mode: str        # 权限档位 strict/default/permissive（ch06）
     sandbox_roots: [str]        # 路径沙箱允许的目录，留空 = 只允许项目根（ch06）
     extra_deny_patterns: [str]  # 追加的危险命令黑名单（正则，只能加严）（ch06）
+    mcp_servers: [...]          # 要接进来的 MCP server（ch07）
+    context_window: int         # 模型窗口多大；0 = 按 protocol 查表（ch08）
+    compact_threshold: float    # 到窗口的百分之多少触发摘要压缩，默认 0.8（ch08）
+    compact_keep_ratio: float   # 压缩后保留多近的历史，默认 0.3（ch08）
+    max_tool_result_tokens: int # 单个工具结果超多少就挪到磁盘，默认 2000（ch08）
 """
 
 from __future__ import annotations  # 让"类型注解"能用更简洁的写法（旧 Python 也兼容）

@@ -238,17 +238,27 @@ def safe_cut_index(messages: list[Message], start: int) -> int:
     简单——一条 user 消息只要携带 tool_results，就说明它前面必定有个 assistant
     的调用。于是这种消息**不能当尾巴的开头**，跳过它往后继续找。
 
-    返回修正后的下标。若一直挪到末尾都找不到（极端情况），返回 ``len(messages)``
-    —— 表示"没东西可留"，由调用方决定怎么办（通常是这次先不压缩）。
+    ★ 找不到怎么办？**往前找。**
+    这个函数先往后找（最贴近 token 预算的那个干净切点）。但如果一直挪到末尾都
+    没找着——说明保留段里全是结果消息，尾巴会被切空——那就掉头往回找。
+
+    为什么要这个兜底？因为"多留一点历史"永远比"放弃压缩"划算：放弃的话，下一轮
+    还是超，窗口该爆还是会爆。宁可这次少省一点，也要把这一刀切下去。
     """
-    i = max(0, start)  # 负数当下标会从末尾倒数，先夹到 0
-    while i < len(messages):  # 一路往后找
+    lo = max(0, start)  # 负数当下标会从末尾倒数，先夹到 0
+
+    for i in range(lo, len(messages)):  # ① 往后找：最贴近预算的干净切点
         m = messages[i]
-        if m.role == ROLE_USER and m.tool_results:  # 这是"某次调用的结果"
-            i += 1  # 它的调用大概率在头部 → 会变孤儿 → 跳过
-            continue
-        break  # 不是结果消息（助手说的 / 用户说的话）→ 这里就是干净切点
-    return i
+        if not (m.role == ROLE_USER and m.tool_results):  # 不是"某次调用的结果"
+            return i  # 助手说的 / 用户说的话 → 干净，就切这
+
+    # ② 往后一无所获 → 往回找，宁可多留点历史
+    for i in range(min(lo, len(messages) - 1), -1, -1):
+        m = messages[i]
+        if not (m.role == ROLE_USER and m.tool_results):
+            return i
+
+    return len(messages)  # 全军覆没（整段都是结果消息）→ 交给调用方放弃这次压缩
 
 
 def estimate_overhead(system: str = "", schemas: list | None = None) -> int:

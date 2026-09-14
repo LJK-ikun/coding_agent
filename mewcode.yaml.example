@@ -37,6 +37,15 @@ mcp_servers: []
 #     headers: {Authorization: "Bearer xxx"}
 #     timeout: 60              # 单请求超时秒数
 
+# --- ch08：上下文管理(四段都可省略，省略即"按协议查窗口 + 默认比例") ---
+# 干得越久，对话越长，迟早撞上模型的上下文窗口。撞上要么报错要么贵得离谱。
+# 这里四个旋钮控制 MewCode 怎么自己瘦身（详见 README ch08）。
+context_window: 0          # 模型能装多少 token；0 = 按 protocol 查表(anthropic 200k / openai 128k)
+compact_threshold: 0.8     # 用到窗口的百分之多少就自动压缩；留 20% 给摘要请求自己用
+compact_keep_ratio: 0.3    # 压缩后保留多近的历史；最近的最相关，越老越可以粗
+max_tool_result_tokens: 2000  # 单个工具结果超多少 token 就挪到磁盘(只留预览+路径)；0 = 关掉
+# 例(想更早、更狠地压)：compact_threshold: 0.6 / compact_keep_ratio: 0.2
+
 # --- 或 OpenAI ---
 # protocol: openai
 # model: gpt-4o-mini
