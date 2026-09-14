@@ -95,14 +95,39 @@ DEFAULT_MODULES: list[PromptModule] = [
 ]
 
 
-def build_system_prompt(modules: list[PromptModule] | None = None) -> str:
+#: ch09：项目指令模块的优先级。给个很大的数 = 排在所有内置模块之后。
+#: 为什么垫底？因为"越具体越靠后"——项目自己的约定比通用规则更具体，
+#: 而且提示词尾部离模型开始回答最近，对它的实际影响更强。
+PROJECT_INSTRUCTION_PRIORITY = 100
+
+
+def build_system_prompt(
+    modules: list[PromptModule] | None = None,
+    project_instructions: str = "",
+) -> str:
     """按优先级把若干指令零件拼成一段稳定的 system 文本。
 
     默认用 `DEFAULT_MODULES`；也可传入自定义模块表(测试/扩展用)。
     拼装 = 按 priority 升序排序 → 依次接上。返回的是**纯稳定文本**——
     不含任何 cwd/时间/git 等易变信息(那些走 `collect_env`)。
+
+    ``project_instructions``（ch09）：项目根那份 MEWCODE.md 的正文。
+    ★ 传进来是**纯文本**、不是路径——读文件是有 IO 的事，留给调用方做。
+      这样本模块继续"不碰磁盘"，离线测试照样秒跑。
     """
-    ordered = sorted(modules if modules is not None else DEFAULT_MODULES, key=lambda m: m.priority)
+    ordered = list(modules if modules is not None else DEFAULT_MODULES)
+    if project_instructions.strip():  # 空文件/没有文件 → 连模块都不加，system 保持原样
+        ordered.append(
+            PromptModule(
+                key="project_instructions",
+                priority=PROJECT_INSTRUCTION_PRIORITY,
+                content=(
+                    "以下是本项目的专属约定，优先于上面的通用规则；"
+                    "与之冲突时，以本项目约定为准。\n\n" + project_instructions.strip()
+                ),
+            )
+        )
+    ordered.sort(key=lambda m: m.priority)
     # 逐块拼。块之间用一个空行隔开，让模型看得出"这是几条独立规矩"。
     return "\n\n".join(m.content for m in ordered)
 

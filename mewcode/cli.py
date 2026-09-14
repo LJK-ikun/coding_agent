@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time  # ch09：算"距上次对话过了多久"
 
 from .agent import (  # ch04：用 Agent 驱动"自动反复动手"的循环
     Agent,
@@ -35,6 +36,26 @@ from .conversation import ConversationManager
 from .errors import LLMError, RateLimitError
 from .mcp.manager import McpManager  # ch07：MCP 连接池（一批远端 server 的管家）
 from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 system + 取环境
+from .instructions import load_instructions  # ch09：两层指令文件
+from .notes import (  # ch09：自动笔记（两级 memory.md）
+    load_notes,
+    notes_block,
+    project_notes_path,
+    save_notes,
+    update_notes,
+    user_notes_path,
+)
+from .session_store import (  # ch09：会话存档（JSONL + meta）
+    append_compact_marker,
+    append_message,
+    latest_session,
+    list_sessions,
+    new_session_id,
+    read_meta,
+    replay,
+    session_path,
+    write_meta,
+)
 from .tools import build_default_registry, ToolRunner  # ch04/ch06：注册中心 + 执行器
 from .tools.base import StreamEnd, TextDelta, ThinkingDelta
 from .tools.permission import (  # ch06：权限门卫 + HITL 的四种答复
@@ -50,6 +71,15 @@ from .tools.permission import (  # ch06：权限门卫 + HITL 的四种答复
 _DIM = "\x1b[2m"  # ANSI转义码： 暗色文本
 _RESET = "\x1b[0m"  # ANSI转义码： 回复终端默认颜色
 _YELLOW = "\x1b[33m"  # ANSI转义码： 黄色（用于权限确认这类"要你拿主意"的提示）
+
+#: ch09：每聊几轮就让模型回头整理一次笔记
+NOTES_EVERY_ROUNDS = 5
+
+#: ch09：距上次活跃超过这么久，下次接上时提醒一句（秒）
+IDLE_REMINDER_SECONDS = 30 * 60
+
+#: ch09：更新笔记时回看最近多少条消息（只喂最近这段，不重读整本历史）
+NOTES_LOOKBACK = 20
 
 
 # =============================================================
@@ -160,6 +190,9 @@ async def run(
     system: str = "",
     show_thinking: bool = False,
     mode: str | None = None,  # ch06：命令行 --mode 覆盖 YAML 里的档位
+    project_instructions: str = "",  # ch09：指令正文(已读好、已拼好)，只为在启动屏报个数
+    resume_id: str | None = None,  # ch09：--resume，接上指定的那个会话
+    continue_last: bool = False,  # ch09：--continue，接上最近一条会话
 ) -> int:
     client = create_client(cfg)
     cm = ConversationManager()
@@ -190,6 +223,48 @@ async def run(
         compactor=compactor,
         max_tool_result_tokens=cfg.max_tool_result_tokens,
     )
+
+    # ---------------------------------------------------------------
+    # ch09：开场——把会话存档和笔记准备好
+    # ---------------------------------------------------------------
+    cwd = os.getcwd()
+    # 要接旧的 → 沿用它的 ID（往同一个文件里接着追加）；否则造个新的。
+    want = resume_id or (latest_session(cwd) if continue_last else None)
+    session_id = want or new_session_id()
+    store = session_path(cwd, session_id)
+    idle = ""  # 久别提醒：临时消息，随请求送出去、不写回历史
+    if want:
+        old_meta = read_meta(cwd, session_id) or {}
+        r = replay(store)  # 回放：坏行跳过、悬空调用截断、压缩标记换纪要
+        cm.restore(r.messages)
+        print(f"恢复: {session_id} — {len(r.messages)} 条消息")
+        if r.bad_lines:  # 存档有损就得说，不然用户对着一份缺东西的历史干瞪眼
+            print(f"  ⚠ 有 {r.bad_lines} 行读不动，已跳过")
+        if r.truncated:
+            print(f"  ⚠ 尾部 {r.truncated} 条工具调用没等到结果，已截断到最后完整位置")
+        gap = time.time() - old_meta.get("updated", 0)
+        if gap > IDLE_REMINDER_SECONDS:  # 隔太久了，先说一句"上次是上次"
+            idle = f"[提示] 距上次对话已经过了 {int(gap // 3600)} 小时。"
+        if compactor.should_compact(cm.messages):  # 太长就先压一次，别第一轮就超限
+            result = await compactor.compact(cm)
+            if result:
+                append_compact_marker(store, result.summary)  # 存档里记下"这儿压过"
+                print(
+                    f"[压缩] 恢复时先压了一次："
+                    f"{result.before_tokens} -> {result.after_tokens} token"
+                )
+    archived = len(cm.messages)  # 已经落盘的消息条数（恢复来的本来就在文件里）
+
+    def _archive() -> None:
+        """把还没落盘的消息补写进存档。追加写，所以只写新的那几条。"""
+        nonlocal archived
+        while archived < len(cm.messages):
+            append_message(store, cm.messages[archived])
+            archived += 1
+
+    # ch09：两级笔记的位置。用户级跟着人走，项目级跟着项目走。
+    user_notes = user_notes_path()
+    project_notes = project_notes_path(cwd)
     # ch07：把配置里的 MCP server 全连上，收到的远端工具并肩装进同一张注册中心。
     # ★ 顺序有讲究：必须在 agent 造好之前装完，否则工具清单进了提示词却对不上。
     # ★ connect 是尽力而为的：某个 server 连不上只记进 mcp.errors，不拦启动。
@@ -214,8 +289,22 @@ async def run(
         f"用到 {compactor.trigger_tokens}（{compactor.threshold:.0%}）自动压缩，"
         f"保留最近 {compactor.keep_tokens}"
     )
-    print("Type a message, or /exit /clear /model /mode /permissions /compact.  Ctrl+C aborts.\n")
+    # ch09：说清指令有没有生效。改了 MEWCODE.md 却没看到变化时，好歹知道是不是没读进去。
+    if project_instructions:
+        print(
+            f"指令: 已加载（{len(project_instructions)} 字符，"
+            f"注入 system 末尾，优先于通用规则）"
+        )
+    # ch09：把会话和笔记的位置亮出来——不然用户不知道 /memory edit 该去改哪个文件
+    print(f"会话: {session_id}  （存档 {store}）")
+    print(f"笔记: 用户级 {user_notes}")
+    print(f"      项目级 {project_notes}")
+    print(
+        "Type a message, or /exit /clear /model /mode /permissions /compact"
+        " /sessions /memory.  Ctrl+C aborts.\n"
+    )
 
+    rounds = 0  # ch09：这一场聊了几轮（用来决定什么时候回头整理笔记）
     while True:
         try:
             # 无限循环聊天
@@ -241,6 +330,7 @@ async def run(
             break
         if text == "/clear":
             cm.clear()
+            archived = 0  # ch09：历史清空了，落盘进度也跟着归零（存档文件本身留着）
             print("(history cleared)")
             continue
         # /clear 调用对话管理器，清空全部聊天历史；continue回到循环开头等待输入
@@ -264,6 +354,30 @@ async def run(
         if text == "/permissions":
             print(engine.describe())
             continue
+        # ch09：/sessions 列出所有会话。只读 meta 小文件——这正是 meta 存在的理由，
+        # 不用把每个会话的 JSONL 整个读一遍。
+        if text == "/sessions":
+            metas = list_sessions(cwd)
+            if not metas:
+                print("(还没有任何会话)")
+            for m in metas[:10]:  # 只列最近 10 条，免得刷屏
+                print(f"  {m['id']}  {m['messages']:>4} 条  {m['title']}")
+            continue
+        # ch09：/memory 看笔记、/memory clear 清空、/memory edit 打印路径
+        if text == "/memory" or text.startswith("/memory "):
+            arg = text[len("/memory") :].strip()
+            if arg == "edit":  # 只报路径，不替你启编辑器（跨平台省事）
+                print(f"用户级: {user_notes}\n项目级: {project_notes}")
+            elif arg in ("clear user", "clear project"):
+                target = user_notes if arg.endswith("user") else project_notes
+                save_notes(target, "")  # 清空 = 写空
+                print(f"已清空: {target}")
+            elif arg:
+                print("用法: /memory | /memory clear user|project | /memory edit")
+            else:
+                print(f"用户级 {user_notes}\n{load_notes(user_notes) or '（空）'}")
+                print(f"\n项目级 {project_notes}\n{load_notes(project_notes) or '（空）'}")
+            continue
         # ch08：/compact 随时手动压一次。不走阈值判断——你想压就压。
         # 用途：干完一件事准备开新话题，或觉得这轮要读一堆大文件、先腾地方。
         if text == "/compact":
@@ -284,21 +398,46 @@ async def run(
                     f"（省 {result.saved_tokens}，{result.summarized} 条并成纪要，"
                     f"保留最近 {result.kept} 条）"
                 )
+                # ch09：存档里补一行"这儿压过"。回放时看到它就把被顶替的那段整段跳过，
+                #   否则恢复出来的历史会比退出时更长——等于这次压缩白压。
+                append_compact_marker(store, result.summary)
+                archived = len(cm.messages)  # 压缩换掉了整段历史，落盘进度跟着重算
             continue
 
         # /model打印当前使用的协议，模型名称
         # 输入普通问题的时候调用
         cm.add_user(text)
+        _archive()  # ch09：用户这句先落盘——接下来要是调模型崩了，这句也留得住
         try:
             # ch05：每个用户回合现取一次环境(时间/git 会变)，并标成"仅供上下文参考"，
             # 让 Agent 把它作为首条临时消息送出去——不落历史、不进缓存前缀。
-            env = (
-                "[环境信息·仅供上下文参考，不必当作需要回答的问题]\n"
-                + collect_env(os.getcwd())
-            )
+            # ch09：同一条通道再捎上"距上次多久"和两级长期笔记。都当成"当前这轮的
+            #   附加材料"，一样不落历史——笔记下轮重读，改了立刻生效。
+            parts = [
+                "[环境信息·仅供上下文参考，不必当作需要回答的问题]\n" + collect_env(os.getcwd())
+            ]
+            if idle:
+                parts.append(idle)
+                idle = ""  # 只提醒一次，之后就一直摆着反而烦
+            nb = notes_block(load_notes(user_notes), load_notes(project_notes))
+            if nb:
+                parts.append(nb)
+            env = "\n\n".join(parts)
             # 让 Agent 自动循环：反复问模型→跑工具→回灌，直到它不再要工具。
             # Agent 内部自己造 runner/schemas，cli 只当"显示器"看它吐的事件。
             await _run_agent_turn(agent, cm, system, env, show_thinking)
+            _archive()  # ch09：这一轮的问和答都落盘
+            rounds += 1
+            # ch09：隔几轮回头整理一次笔记。整段包在 try 里——笔记是"顺手做的事"，
+            #   做不成也不能把这场对话带走。
+            if rounds % NOTES_EVERY_ROUNDS == 0:
+                try:
+                    if await update_notes(
+                        client, cm.messages[-NOTES_LOOKBACK:], user_notes, project_notes
+                    ):
+                        print("[笔记] 已更新")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[笔记] 这次没整理成：{exc}")
             # except处理调用大模型期间的异常
         except KeyboardInterrupt:
             print("\n(aborted)")
@@ -313,6 +452,16 @@ async def run(
             if os.environ.get("MEW_DEBUG"):  # os 已在本模块顶部 import，此处直接用
                 raise
             print(f"\n[error] {exc}")
+    # ch09：收摊前最后两件事——整理一次笔记，再刷新会话名片。
+    # 都包在 try 里：退出路径上再抛异常，用户就看不到正常退出了。
+    try:
+        await update_notes(client, cm.messages[-NOTES_LOOKBACK:], user_notes, project_notes)
+    except Exception:  # noqa: BLE001
+        pass  # 退都退了，整理不成就算了（每 5 轮那次才是主力）
+    try:
+        write_meta(cwd, session_id, cm.messages)
+    except Exception:  # noqa: BLE001
+        pass
     # ch07：收摊。所有正常退出路径（/exit、Ctrl+D）都汇到这里。
     # 关闭本身带幂等 + 超时兜底，某个 server 赖着不走也不会卡住退出。
     await mcp.close()
@@ -328,6 +477,11 @@ def main(argv: list[str] | None = None) -> int:
         help="可选的系统提示词。缺省时用内置模块(ch05 build_system_prompt)自动装配",
     )
     ap.add_argument("--show-thinking", action="store_true", help="同时打印模型的思考/推理过程")
+    # ch09：接着上次聊。--continue 接最近的，--resume 接指定 ID（ID 见 /sessions）
+    ap.add_argument(
+        "--continue", dest="continue_last", action="store_true", help="恢复最近一次会话"
+    )
+    ap.add_argument("--resume", default=None, metavar="ID", help="恢复指定会话（ID 见 /sessions）")
     # ch06：一次性覆盖 YAML 里的权限档位（比如这次只想小心行事：--mode strict）
     ap.add_argument(
         "--mode",
@@ -351,13 +505,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # ch05：稳定 system 只在启动时装配一次(不随每轮 env 变)——
         # 传了 --system 就用它，否则用内置模块按优先级拼装。
-        stable_system = args.system if args.system else build_system_prompt()
+        # ch09：装配时把两层指令(项目级 + 用户级)读进来，排在所有内置模块之后。
+        #   ★ 只读这一次：指令属于"稳定前缀"，会话中途改文件不重读——
+        #     重读会让前缀变、缓存全失效，而且"规则半路换了"比"改了没生效"更难查。
+        project_instructions = load_instructions(os.getcwd())
+        stable_system = args.system if args.system else build_system_prompt(
+            project_instructions=project_instructions
+        )
         return asyncio.run(
             run(
                 cfg,
                 system=stable_system,
                 show_thinking=args.show_thinking,
+                project_instructions=project_instructions,
                 mode=args.mode,  # 命令行没给就是 None，run 里回落到 cfg.permission_mode
+                resume_id=args.resume,
+                continue_last=args.continue_last,
             )
         )
     except KeyboardInterrupt:

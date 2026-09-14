@@ -162,6 +162,7 @@ class Compactor:
         before = estimate_messages_tokens(messages)  # 压之前占多少
 
         # ② 摘：把头部摊成文本，连同模板一起发给 LLM，把它的回复攒成纪要。
+        # 这一段的作用，把带压缩的就对话，打包成请求发给LLM，流式接收模型返回的纪要文本，最后拿到完整 summary；如果模型啥都没返回，就放弃本次压缩
         transcript = render_transcript(head)
         ask = Message(
             role=ROLE_USER,
