@@ -20,13 +20,17 @@ import sys
 
 from .agent import (  # ch04：用 Agent 驱动"自动反复动手"的循环
     Agent,
+    AgentCompacted,  # ch08：旧对话被压成纪要
     AgentFinished,
+    AgentResultsOffloaded,  # ch08：大结果被挪到磁盘
     AgentToolBatch,
     AgentToolResult,
     AgentTokensEscalated,
 )
 from .client import create_client
+from .compact import Compactor  # ch08：第 2 层压缩——LLM 摘要
 from .config import ProviderConfig, load_config
+from .context import estimate_messages_tokens  # ch08：量一量现在占多少
 from .conversation import ConversationManager
 from .errors import LLMError, RateLimitError
 from .mcp.manager import McpManager  # ch07：MCP 连接池（一批远端 server 的管家）
@@ -124,6 +128,16 @@ async def _run_agent_turn(
             print(f"{tag} tool {r.tool_use_id} -> {r.content}")
         elif isinstance(ev, AgentTokensEscalated):
             print(f"\n[max_tokens 耗尽：单轮预算 {ev.old_max} -> {ev.new_max}，整轮重试]")
+        # ch08：第 1 层瘦身——大结果被挪到磁盘，对话里只留预览+路径
+        elif isinstance(ev, AgentResultsOffloaded):
+            print(f"\n[上下文] {ev.count} 个大工具结果已挪到磁盘（对话里只留路径）")
+        # ch08：第 2 层瘦身——旧对话被压成纪要，token 掉下来了
+        elif isinstance(ev, AgentCompacted):
+            r = ev.result
+            print(
+                f"\n[压缩] {r.before_tokens} -> {r.after_tokens} token"
+                f"（省 {r.saved_tokens}，{r.summarized} 条并成纪要，保留最近 {r.kept} 条）"
+            )
         elif isinstance(ev, StreamEnd):
             # ch05：把 prompt 缓存计量露出来——cache_read>0 说明这轮复用了缓存前缀
             if ev.cache_read_input_tokens or ev.cache_creation_input_tokens:
@@ -161,7 +175,21 @@ async def run(
         deny_patterns=cfg.extra_deny_patterns or None,  # 用户追加的黑名单
     )
     runner = ToolRunner(registry, guard=engine, ask=_ask_permission)
-    agent = Agent(client=client, registry=registry, runner=runner)
+    # ch08：造压缩器，再挂进 Agent——从此它每轮开工前会自己"量一量、瘦一瘦"。
+    # 窗口大小、触发比例、保留比例都可以在 YAML 里调（见 config.py 格子 13~16）。
+    compactor = Compactor(
+        client=client,
+        context_window=cfg.resolved_context_window(),
+        threshold=cfg.compact_threshold,
+        keep_ratio=cfg.compact_keep_ratio,
+    )
+    agent = Agent(
+        client=client,
+        registry=registry,
+        runner=runner,
+        compactor=compactor,
+        max_tool_result_tokens=cfg.max_tool_result_tokens,
+    )
     # ch07：把配置里的 MCP server 全连上，收到的远端工具并肩装进同一张注册中心。
     # ★ 顺序有讲究：必须在 agent 造好之前装完，否则工具清单进了提示词却对不上。
     # ★ connect 是尽力而为的：某个 server 连不上只记进 mcp.errors，不拦启动。
@@ -180,7 +208,13 @@ async def run(
         print(f"mcp: server {name!r} 未连接 — {err}")
     # ch06：把"当前护栏有多紧"亮在启动第一屏——用户得知道自己正处在什么档位下
     print(f"权限: mode={engine.mode}  沙箱根={', '.join(engine.roots)}")
-    print("Type a message, or /exit /clear /model /mode /permissions.  Ctrl+C aborts.\n")
+    # ch08：把"上下文何时开始瘦身"亮出来——用户得知道它会在什么时候自己动手
+    print(
+        f"上下文: 窗口 {compactor.context_window} token，"
+        f"用到 {compactor.trigger_tokens}（{compactor.threshold:.0%}）自动压缩，"
+        f"保留最近 {compactor.keep_tokens}"
+    )
+    print("Type a message, or /exit /clear /model /mode /permissions /compact.  Ctrl+C aborts.\n")
 
     while True:
         try:
@@ -229,6 +263,27 @@ async def run(
         # 以及三层规则各自是什么（含本会话临时授权的那几条，看得到才放心）。
         if text == "/permissions":
             print(engine.describe())
+            continue
+        # ch08：/compact 随时手动压一次。不走阈值判断——你想压就压。
+        # 用途：干完一件事准备开新话题，或觉得这轮要读一堆大文件、先腾地方。
+        if text == "/compact":
+            before = estimate_messages_tokens(cm.messages)
+            if before == 0:
+                print("(历史是空的，没什么可压)")
+                continue
+            try:
+                result = await compactor.compact(cm)
+            except LLMError as exc:  # 摘要要联网，出错别把 REPL 搞崩
+                print(f"\n[压缩失败] {exc}")
+                continue
+            if result is None:  # 切不动：历史太短，或者正好都落在保留段里
+                print(f"(当前 {before} token，还没到能压的程度)")
+            else:
+                print(
+                    f"[压缩] {result.before_tokens} -> {result.after_tokens} token"
+                    f"（省 {result.saved_tokens}，{result.summarized} 条并成纪要，"
+                    f"保留最近 {result.kept} 条）"
+                )
             continue
 
         # /model打印当前使用的协议，模型名称

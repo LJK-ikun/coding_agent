@@ -44,6 +44,11 @@ from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 from .client import LLMClient
+from .context import (  # ch08：上下文瘦身的两把家伙
+    DEFAULT_MAX_RESULT_TOKENS,
+    estimate_overhead,
+    shrink_large_results,
+)
 from .conversation import ConversationManager
 from .models import ROLE_USER, Message, ToolCallResult
 from .tools.base import StreamEnd, TextDelta, ThinkingDelta
@@ -87,6 +92,20 @@ class AgentTokensEscalated:
 
 
 @dataclass
+class AgentResultsOffloaded:
+    """第 1 层瘦身做过了：有几个大工具结果被挪到磁盘（ch08）。"""
+
+    count: int  # 挪走了几条
+
+
+@dataclass
+class AgentCompacted:
+    """第 2 层瘦身做过了：旧对话已被压成纪要（ch08）。"""
+
+    result: Any  # compact.CompactResult——含前后 token、纪要正文
+
+
+@dataclass
 class AgentFinished:
     """整个 run() 结束。reason 说明为什么收场。"""
 
@@ -101,6 +120,8 @@ AgentEvent = Union[
     AgentToolBatch,  # 要跑一批工具了
     AgentToolResult,  # 一个工具跑完了
     AgentTokensEscalated,  # max_tokens 升档了
+    AgentResultsOffloaded,  # ch08：大结果被挪到磁盘了
+    AgentCompacted,  # ch08：旧对话被压成纪要了
     AgentFinished,  # 整个 run 结束
 ]
 
@@ -124,6 +145,10 @@ class Agent:
         permission_checker: Any = None,  # ch 后续：权限/HITL
         hook_engine: Any = None,  # ch 后续：钩子
         memory_manager: Any = None,  # ch 后续：记忆
+        # --- ch08：上下文瘦身（不传 compactor 就只做第 1 层）---
+        compactor: Any = None,  # compact.Compactor；None = 不做摘要压缩
+        max_tool_result_tokens: int = DEFAULT_MAX_RESULT_TOKENS,  # 超多少就挪走
+        context_store_dir: str = ".mewcode/context",  # 挪到哪个目录
     ) -> None:
         self.client = client
         self.registry = registry
@@ -141,6 +166,10 @@ class Agent:
         self.permission_checker = permission_checker
         self.hook_engine = hook_engine
         self.memory_manager = memory_manager
+        # ch08：上下文瘦身的两层家伙。compactor 是 None 时，第 2 层整个跳过。
+        self.compactor = compactor
+        self.max_tool_result_tokens = max_tool_result_tokens
+        self.context_store_dir = context_store_dir
 
     async def _next_budget(self, old: int) -> int:
         """算升档后的新预算：旧的乘上系数，但顶到天花板为止。"""
@@ -156,7 +185,23 @@ class Agent:
     ) -> AsyncIterator[AgentEvent]:
         """跑整段自动循环，边跑边吐事件。结束原因见 `AgentFinished`。"""
         schemas = self.registry.schemas()  # 工具"说明书"，每轮随请求发给模型
+        # ch08：固定开销只算一次——system 和工具清单在整段 run 里不会变。
+        # 判断"到没到 80%"时必须把它算上，否则会乐观地以为还早。
+        overhead = estimate_overhead(system, schemas)
         for turn in range(1, self.max_iterations + 1):  # 有上限，防死循环
+            # ⓪ ch08：开工前先瘦身。顺序不能反——先做便宜的：
+            #    第 1 层（本地挪盘，几乎免费），做完常常就不超了；
+            #    真超了才轮到第 2 层（调 LLM 写纪要，要花钱花时间）。
+            moved = shrink_large_results(
+                cm.messages, self.max_tool_result_tokens, self.context_store_dir
+            )
+            if moved:  # 挪过东西才报事件，免得每轮都刷屏
+                yield AgentResultsOffloaded(count=moved)
+            if self.compactor is not None and self.compactor.should_compact(cm.messages, overhead):
+                compact_result = await self.compactor.compact(cm)
+                if compact_result is not None:  # None = 这轮切不动，下轮再试
+                    yield AgentCompacted(result=compact_result)
+
             # ① 跑一轮模型回复(含升档重试)，把该轮的流事件转发给上层。
             #    生成器不能 return 值，所以它把"停下来的原因"存进 _turn_stop。
             self._turn_stop = ""

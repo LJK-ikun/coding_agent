@@ -13,3 +13,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# ch08: 大工具结果挪到磁盘后的落点（临时缓存，不必入库）
+.mewcode/

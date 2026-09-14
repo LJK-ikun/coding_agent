@@ -57,6 +57,13 @@ DEFAULT_BASE_URLS = {
     PROTOCOL_OPENAI: "https://api.openai.com/v1",  # OpenAI 的官方地址
 }
 
+# ch08：上下文窗口大小（token）的默认值，按协议查表。留空时用它兜底。
+# 这数只影响"什么时候开始压缩"的判断，填错了不会崩，只是压得早或晚。
+DEFAULT_CONTEXT_WINDOWS = {
+    PROTOCOL_ANTHROPIC: 200_000,  # Claude 主流型号的窗口
+    PROTOCOL_OPENAI: 128_000,  # OpenAI 主流型号的窗口
+}
+
 
 #: 远端工具名里的分隔符（跟 adapter.py 里保持一致）。配置层校验 name 要用它。
 MCP_SEP = "__"
@@ -131,6 +138,22 @@ class ProviderConfig:
     # 格子12（ch07）: 要接进来的 MCP server 列表。留空 = 不接任何远端工具，
     #                行为跟以前完全一样。
     mcp_servers: list = field(default_factory=list)
+    # ↓↓ ch08：上下文管理的四个格子。都不填也能跑（走"按协议查表 + 默认比例"）↓↓
+    # 格子13: 模型能装多少 token。0 = 按 protocol 查 DEFAULT_CONTEXT_WINDOWS。
+    #        填错的后果只是"压早了/压晚了"，不会崩，所以放心填。
+    context_window: int = 0
+    # 格子14: 用到窗口的百分之多少就触发摘要压缩。默认 0.8——留 20% 给摘要请求
+    #        自己用（详见 compact.py 的"救生艇"注释）。
+    compact_threshold: float = 0.8
+    # 格子15: 压缩后保留多近的历史（占窗口的比例）。默认 0.3——最近的最相关。
+    compact_keep_ratio: float = 0.3
+    # 格子16: 单个工具结果超过多少 token 就挪到磁盘（第 1 层压缩）。
+    #        0 = 关掉第 1 层（不建议：那是几乎免费的一层）。
+    max_tool_result_tokens: int = 2000
+
+    def resolved_context_window(self) -> int:  # 技能③（ch08）：算出实际窗口大小
+        """返回上下文窗口大小：填了就用填的，没填按协议查表。"""
+        return self.context_window or DEFAULT_CONTEXT_WINDOWS.get(self.protocol, 128_000)
 
     def resolved_base_url(self) -> str:  # 技能①：算出"最后真正去请求的网址"
         """返回实际请求地址：base_url 为空时用厂商默认值，再去掉末尾斜杠。"""
@@ -251,6 +274,11 @@ def load_config(path: str | Path) -> ProviderConfig:  # 读取器：给路径，
         extra_deny_patterns=_as_str_list(raw.get("extra_deny_patterns")),
         # ch07 要接进来的 MCP server：列表式或映射式都收（见 _as_mcp_servers）。
         mcp_servers=_as_mcp_servers(raw.get("mcp_servers")),
+        # ch08 上下文管理：窗口大小（0 = 按协议查表）+ 三个比例/阈值。
+        context_window=int(raw.get("context_window", 0)),
+        compact_threshold=float(raw.get("compact_threshold", 0.8)),
+        compact_keep_ratio=float(raw.get("compact_keep_ratio", 0.3)),
+        max_tool_result_tokens=int(raw.get("max_tool_result_tokens", 2000)),
     )
     cfg.validate()  # 填完调 validate 做最后检查（漏了 key 之类在这报）
     return cfg  # 检查通过，把填好的盒子交出去，给后面的 client 用

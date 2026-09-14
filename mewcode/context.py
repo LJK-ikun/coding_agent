@@ -251,6 +251,19 @@ def safe_cut_index(messages: list[Message], start: int) -> int:
     return i
 
 
+def estimate_overhead(system: str = "", schemas: list | None = None) -> int:
+    """估历史之外那些"每轮都发"的固定开销：system 提示词 + 工具清单。
+
+    ★ 为什么要单算？因为它们不写在 ``messages`` 里，量历史时天然被漏掉。可模型
+    每轮都真真切切地收到它们——漏算这部分，判断"到没到 80%"就会偏乐观，等发现
+    时窗口已经真不够了。
+    """
+    total = estimate_tokens(system)  # system 提示词
+    if schemas:  # 工具清单（一串 JSON schema）
+        total += estimate_tokens(json.dumps(schemas, ensure_ascii=False))
+    return total
+
+
 def keep_start_index(messages: list[Message], keep_tokens: int) -> int:
     """从末尾往前数，攒够 ``keep_tokens`` 就停下——这里就是"保留段"的开头。
 
