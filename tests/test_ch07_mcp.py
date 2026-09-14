@@ -30,6 +30,7 @@ import pytest  # 断言异常用 pytest.raises
 from mewcode.config import McpServerConfig  # T5 用：配置层的盒子
 from mewcode.config import _as_mcp_servers  # T5 用：YAML 片段 → 盒子列表
 from mewcode.mcp import adapter as ad  # 被测层 4：适配
+from mewcode.mcp import lazy as lz  # 被测层 6：延迟加载
 from mewcode.mcp import manager as mg  # 被测层 5：连接池
 from mewcode.mcp import protocol as proto  # 被测层 1
 from mewcode.mcp import transport as tp  # 被测层 2
@@ -986,6 +987,216 @@ def test_stdio_end_to_end_against_real_subprocess():
             await m.close()
 
     asyncio.run(go())
+
+
+def test_stdio_deferred_tools_are_still_callable():
+    """★ 延迟加载只是"清单里少发点"，不改变能不能调——照常真调通。"""
+
+    async def go():
+        m = mg.McpManager(
+            [
+                McpServerConfig(
+                    name="fake",
+                    command=sys.executable,
+                    args=[_FAKE_SERVER],
+                    defer_tools=True,
+                )
+            ]
+        )
+        tools = await m.start()
+        try:
+            reg = ToolRegistry()
+            m.register_into(reg)
+            assert "describe_mcp_tool" in reg  # 延迟加载必须配一个"查详情"的入口
+            r = await reg.find("mcp__fake__echo").execute(text="延迟也能调")
+            assert r.ok is True
+            assert r.output == "echo: 延迟也能调"
+        finally:
+            await m.close()
+
+    asyncio.run(go())
+
+
+# =============================================================
+# T7 延迟加载（lazy）
+#
+# 远端工具的参数说明动辄几百 token，几十个堆起来很占上下文，而模型一轮
+# 通常只用其中一两个。这一组验：清单发精简版、完整版按需查得到。
+# =============================================================
+
+
+_FULL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "description": "文件路径" * 20},
+        "encoding": {"type": "string", "enum": ["utf-8", "gbk"]},
+        "limit": {"type": "integer", "default": 100},
+    },
+    "required": ["path"],
+}
+
+
+def _deferred_tool(name="read_file", server="fs", schema=None):
+    """造一个开了延迟加载的远端工具。"""
+    return ad.RemoteTool(
+        server,
+        None,
+        {
+            "name": name,
+            "description": "读取文件内容。\n这里有很长的用法说明……",
+            "inputSchema": schema or _FULL_SCHEMA,
+        },
+        deferred=True,
+    )
+
+
+def test_stub_schema_keeps_only_names_and_required():
+    """★ 精简版只留参数名 + 必填项，其余（类型/枚举/描述/默认值）全砍。"""
+    stub = ad._stub_schema(_FULL_SCHEMA)
+    assert stub["type"] == "object"
+    assert set(stub["properties"]) == {"path", "encoding", "limit"}  # 名字都在
+    assert all(v == {} for v in stub["properties"].values())  # 但没任何约束
+    assert stub["required"] == ["path"]  # 必填项留下（漏了必然翻车）
+    assert "enum" not in json.dumps(stub)  # 枚举被砍掉了
+
+
+def test_stub_schema_omits_required_when_absent():
+    """没有必填项时，别硬塞一个空的 required 进去。"""
+    stub = ad._stub_schema({"type": "object", "properties": {"a": {"type": "string"}}})
+    assert "required" not in stub
+
+
+def test_stub_schema_survives_malformed_input():
+    """schema 残缺（没有 properties / 根本不是字典）时给空壳，不报错。"""
+    assert ad._stub_schema({"type": "object"}) == {"type": "object", "properties": {}}
+    assert ad._stub_schema(None) == {"type": "object", "properties": {}}
+
+
+def test_first_line_truncates_multiline_description():
+    """描述只取第一行并掐长度——多段大论在清单里没地方放。"""
+    assert ad._first_line("第一行\n第二行\n第三行") == "第一行"
+    assert ad._first_line("") == ""
+    assert len(ad._first_line("x" * 500)) == 120  # 默认掐到 120
+
+
+def test_deferred_tool_sends_stub_schema():
+    """★ 延迟加载的工具，发给模型的 input_schema 是精简版。"""
+    api = _deferred_tool().to_api_schema()
+    assert api["input_schema"]["properties"]["path"] == {}  # 没类型、没描述
+    assert "describe_mcp_tool" in api["description"]  # 带路标：告诉模型去哪查
+    assert api["description"].count("\n") == 0  # 描述压成一行
+
+
+def test_deferred_tool_still_exposes_full_schema():
+    """★ 精简的只是"发出去的"，本地仍拿得到完整版（这是查详情的来源）。"""
+    assert _deferred_tool().full_schema() == _FULL_SCHEMA
+
+
+def test_non_deferred_tool_sends_full_schema():
+    """没开延迟：照常发完整版，行为跟以前一模一样。"""
+    tool = ad.RemoteTool("fs", None, {"name": "r", "description": "d", "inputSchema": _FULL_SCHEMA})
+    api = tool.to_api_schema()
+    assert api["input_schema"] == _FULL_SCHEMA
+    assert "describe_mcp_tool" not in api["description"]
+
+
+def test_deferred_costs_fewer_characters():
+    """延迟版确实更省——这是整个特性存在的理由，得能被断言。"""
+    full = ad.RemoteTool("fs", None, {"name": "r", "description": "读文件", "inputSchema": _FULL_SCHEMA})
+    lean = _deferred_tool(name="r")
+    assert len(json.dumps(lean.to_api_schema())) < len(json.dumps(full.to_api_schema()))
+
+
+def test_describe_tool_lists_deferred_tools():
+    """不传 name → 列出全部（名字 + 一行说明）。"""
+    d = lz.DescribeMcpTool([_deferred_tool(), _deferred_tool(name="write_file")])
+    out = asyncio.run(d.execute()).output
+    assert "mcp__fs__read_file" in out
+    assert "mcp__fs__write_file" in out
+
+
+def test_describe_tool_returns_full_schema():
+    """传 name → 给这一个工具的完整定义（模型靠它填对参数）。"""
+    d = lz.DescribeMcpTool([_deferred_tool()])
+    out = asyncio.run(d.execute(name="mcp__fs__read_file")).output
+    assert "mcp__fs__read_file" in out
+    assert '"enum"' in out  # ★ 完整版里的枚举必须在这儿出现
+    assert "utf-8" in out
+
+
+def test_describe_tool_unknown_name_is_failure_with_hints():
+    """★ 查不到时把可选名单一并交回去，模型下一轮就能改对。"""
+    d = lz.DescribeMcpTool([_deferred_tool()])
+    r = asyncio.run(d.execute(name="mcp__fs__nope"))
+    assert r.ok is False
+    assert "mcp__fs__read_file" in r.output  # 名单在报错里
+
+
+def test_describe_tool_ignores_non_deferred_tools():
+    """没延迟的工具完整 schema 早就发给模型了，不该再占清单位置。"""
+    full = ad.RemoteTool("fs", None, {"name": "loud", "description": "d"})  # deferred=False
+    d = lz.DescribeMcpTool([_deferred_tool(), full])
+    assert d.count == 1
+    assert "loud" not in asyncio.run(d.execute()).output
+
+
+def test_describe_tool_with_no_tools_says_so():
+    """一个都没有时给句人话，别返回空字符串让模型猜。"""
+    out = asyncio.run(lz.DescribeMcpTool([]).execute()).output
+    assert out.strip()
+
+
+def test_deferred_tools_helper_filters():
+    """deferred_tools 只挑开延迟的那些。"""
+    lean = _deferred_tool()
+    loud = ad.RemoteTool("fs", None, {"name": "loud", "description": "d"})  # deferred=False
+    assert lz.deferred_tools([lean, loud]) == [lean]
+    assert lz.deferred_tools([loud]) == []
+    assert lz.deferred_tools([]) == []
+
+
+def test_manager_registers_describe_tool_when_deferred(monkeypatch):
+    """★ 有延迟工具就必须同时装上"查详情"的入口——否则模型被蒙住眼睛。"""
+    _patch_transport(monkeypatch, _fake_factory(tools=[{"name": "echo"}]))
+    m = mg.McpManager([McpServerConfig(name="s", command="x", defer_tools=True)])
+    asyncio.run(m.start())
+    reg = ToolRegistry()
+    m.register_into(reg)
+    assert "describe_mcp_tool" in reg
+    asyncio.run(m.close())
+
+
+def test_manager_skips_describe_tool_when_not_deferred(monkeypatch):
+    """没开延迟就不装——没人需要它，装上只是白占一个工具位。"""
+    _patch_transport(monkeypatch, _fake_factory(tools=[{"name": "echo"}]))
+    m = mg.McpManager([McpServerConfig(name="s", command="x", defer_tools=False)])
+    asyncio.run(m.start())
+    reg = ToolRegistry()
+    m.register_into(reg)
+    assert "describe_mcp_tool" not in reg
+    asyncio.run(m.close())
+
+
+def test_manager_honours_defer_tools_flag(monkeypatch):
+    """配置里的 defer_tools 要真的透到工具上——否则开关是假的、白写。"""
+    _patch_transport(monkeypatch, _fake_factory(tools=[{"name": "echo"}]))
+
+    async def flag_of(defer):
+        m = mg.McpManager([McpServerConfig(name="s", command="x", defer_tools=defer)])
+        tools = await m.start()
+        try:
+            return tools[0].deferred
+        finally:
+            await m.close()
+
+    assert asyncio.run(flag_of(True)) is True
+    assert asyncio.run(flag_of(False)) is False
+
+
+def test_config_parses_defer_tools():
+    """配置层：defer_tools 默认开，写 false 才关。"""
+    assert _as_mcp_servers([{"name": "a", "command": "x"}])[0].defer_tools is True
+    assert _as_mcp_servers([{"name": "a", "command": "x", "defer_tools": False}])[0].defer_tools is False
 
 
 def test_stdio_missing_binary_is_recorded_not_raised():

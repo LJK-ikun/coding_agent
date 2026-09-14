@@ -68,17 +68,68 @@ def flatten_content(content: Any) -> str:
     return "\n".join(parts)
 
 
+def _first_line(text: str, limit: int = 120) -> str:
+    """取第一行、掐到 ``limit`` 个字符。延迟加载时描述就这么长。
+
+    远端工具的说明常常是多段大论（用法、示例、注意事项、NOTE……），
+    而对"要不要选这个工具"来说，第一行通常就够了。
+    """
+    head = (text or "").strip().splitlines()  # 按行拆，空文本时得到空列表
+    if not head:
+        return ""  # 压根没描述：返回空串，让调用方自己决定兜什么
+    return head[0].strip()[:limit]  # 第一行 + 掐长度
+
+
+def _stub_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """把完整 schema 压成"只有参数名和必填项"的精简版。
+
+    ★ 为什么眼里只有名字，不保留类型/枚举/描述？
+      类型猜错了模型会自己去查（描述里给了路标）；但**参数名**猜不出来，
+      必须给。所以留下"最小可调用"的信息，其余全砍。
+
+    写出来的形状长这样::
+
+        {"type": "object", "properties": {"path": {}, "limit": {}}, "required": ["path"]}
+
+    每个参数的值是空 schema ``{}``——在 JSON Schema 里意思是"什么都收"，
+    所以模型填什么类型都不会被后端拒掉。
+    """
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    stub_props: Dict[str, Any] = {}
+    if isinstance(props, dict):
+        for key in props:
+            stub_props[str(key)] = {}  # 只留名字；空 schema = 不设任何约束
+    stub: Dict[str, Any] = {"type": "object", "properties": stub_props}
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if isinstance(required, list) and required:
+        # 必填项要留：漏了就必然报错，是唯一"不留就一定会翻车"的信息。
+        stub["required"] = [str(r) for r in required]
+    return stub
+
+
 class RemoteTool(Tool):
     """一个远端 MCP 工具，包成本地 ``Tool`` 的样子。
 
     上层完全看不出它跟 ``ReadFileTool`` 有什么区别——这正是适配层的目的。
+
+    ``deferred=True``（延迟加载）时，发给模型的只有"名字 + 一行描述 + 参数名"，
+    完整说明留在 :meth:`full_schema` 里按需查。远端工具的参数说明动辄几百 token
+    （枚举、嵌套对象、大段 NOTE），几十个工具堆起来能吃掉好几千——而模型一轮
+    通常只用到其中一两个。这是拿"多一次往返"换"每轮都省一大截上下文"。
     """
 
-    def __init__(self, server: str, session: McpSession, spec: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        server: str,
+        session: McpSession,
+        spec: Dict[str, Any],
+        deferred: bool = False,
+    ) -> None:
         self._server = server  # 来自哪个 server（报错时说清是谁）
         self._session = session  # 调它要用的会话
         self._remote_name = str(spec.get("name", ""))  # 对端认识的名字（不带前缀）
         self.name = make_tool_name(server, self._remote_name)  # 我们这边用的全名
+        self.deferred = deferred  # 延迟加载：清单里只发精简版
         # 说明里带上出处：模型看到 "[MCP:xxx]" 才知道这工具哪来的。
         base = str(spec.get("description") or "").strip()
         self.description = (
@@ -101,6 +152,28 @@ class RemoteTool(Tool):
     def server(self) -> str:
         """这个工具来自哪个 server。"""
         return self._server
+
+    def full_schema(self) -> Dict[str, Any]:
+        """完整参数说明。延迟加载时模型靠 ``describe_mcp_tool`` 从这里取。"""
+        return self.parameters
+
+    def to_api_schema(self) -> Dict[str, Any]:
+        """发给模型的工具描述。延迟加载时发精简版。
+
+        精简版保留三样**最影响调用正确率**的东西，砍掉其余的：
+          - 工具名（否则模型根本点不了名）
+          - 一行描述（截断到第一行，只留"这工具干嘛的"）
+          - 参数名 + 必填项（不给类型也能填个八九不离十，猜错了再查）
+        砍掉的是：参数的详细描述、枚举候选、嵌套结构、默认值、大段 NOTE。
+        """
+        if not self.deferred:
+            return super().to_api_schema()  # 没开延迟：照常发完整版
+        return {
+            "name": self.name,
+            # 末尾这句是"路标"：模型看到就知道该去哪儿查细节。
+            "description": f"{_first_line(self.description)}（参数细节用 describe_mcp_tool 查）",
+            "input_schema": _stub_schema(self.parameters),
+        }
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """去远端调一次，把 MCP 的结果翻成本地收据。
@@ -127,16 +200,23 @@ class RemoteTool(Tool):
         return ToolResult.success(text)
 
 
-def adapt_tools(session: McpSession, server: str, specs: List[Dict[str, Any]]) -> List[Tool]:
+def adapt_tools(
+    session: McpSession,
+    server: str,
+    specs: List[Dict[str, Any]],
+    deferred: bool = False,
+) -> List[Tool]:
     """把 ``list_tools()`` 的原始清单批量适配成本地 ``Tool`` 列表。
 
     没有名字的条目直接丢——它连"被模型点名"的资格都没有，收进来只会变成
     一张永远调不动的死工具。
+
+    ``deferred=True`` 时，这一批工具都以"延迟加载"姿态进清单（见 RemoteTool）。
     """
     tools: List[Tool] = []
     for spec in specs or []:
         if not isinstance(spec, dict) or not spec.get("name"):
             continue
-        tools.append(RemoteTool(server, session, spec))
+        tools.append(RemoteTool(server, session, spec, deferred=deferred))
     return tools
     

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Sequence, Tuple  # 类型标注
 from ..tools.interface import Tool  # 收拢出来的东西是本地 Tool
 from ..tools.registry import ToolRegistry  # 可选的"顺手注册进电话簿"入口
 from .adapter import adapt_tools  # 远端工具 → 本地工具的翻译
+from .lazy import DescribeMcpTool, deferred_tools  # ch07 延迟加载：按需查完整 schema
 from .session import McpSession  # 一条连接上的会话
 from .transport import make_transport  # 按配置造管子（stdio 还是 http）
 
@@ -64,6 +65,11 @@ class McpManager:
         """成功连上的 server 名列表。"""
         return list(self._sessions.keys())
 
+    @property
+    def deferred_count(self) -> int:
+        """有多少个远端工具走了"延迟加载"（清单里只发精简版）。"""
+        return len(deferred_tools(self._tools))
+
     async def start(self) -> List[Tool]:
         """并发连上所有 server，返回全部远端工具。
 
@@ -96,7 +102,16 @@ class McpManager:
             session = McpSession(transport, request_timeout=float(getattr(cfg, "timeout", 60.0)))
             await session.start()  # 起管子 + 握手
             specs = await session.list_tools()  # 问它有哪些工具
-            self._tools.extend(adapt_tools(session, cfg.name, specs))  # 翻译成本地工具
+            # 翻译成本地工具。defer_tools 决定这一批是否走"延迟加载"：
+            # 开了的话，模型清单里只出现名字和参数名，完整定义按需查。
+            self._tools.extend(
+                adapt_tools(
+                    session,
+                    cfg.name,
+                    specs,
+                    deferred=bool(getattr(cfg, "defer_tools", False)),
+                )
+            )
             self._sessions[cfg.name] = session  # 握手和列工具都成了，才算"连上"
         except Exception as exc:
             # ★ 一个 server 坏了只记一笔账，绝不上抛。半开的连接要收拾干净。
@@ -134,6 +149,13 @@ class McpManager:
         消失是最坏的选项——用户会以为工具坏了。所以这里数出来交给上层，
         要不要提示、怎么提示，由上层决定。
         """
+        # ★ 先装"查详情"的那个口子：有延迟加载的工具，就必须同时有办法查它们
+        #   的完整定义。只发精简清单却不给查明细节的入口，模型等于被蒙住眼睛——
+        #   它看得见工具名，却永远填不对参数。
+        pending = deferred_tools(self._tools)
+        if pending:
+            registry.register(DescribeMcpTool(pending))
+
         added = 0
         skipped = 0
         for tool in self._tools:

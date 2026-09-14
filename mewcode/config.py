@@ -81,6 +81,11 @@ class McpServerConfig:
     headers: dict = field(default_factory=dict)  # 格子7: http 用——随请求带的头（如鉴权）
     timeout: float = 60.0  # 格子8: 单个请求等回话的上限（秒）
     enabled: bool = True  # 格子9: 关掉它就不连（写配置时想临时停用很方便）
+    # 格子10: 延迟加载工具定义。开着的话，工具清单里这一批只发"名字 + 一行描述 +
+    #        参数名"，完整 schema 等模型真要用了再查（调 describe_mcp_tool）。
+    #        远端工具的说明动辄几百 token，几十个堆起来很占上下文——默认开。
+    #        工具少、说明短的小 server 可以关掉，省一次往返。
+    defer_tools: bool = True
 
     @property
     def kind(self) -> str:
@@ -214,6 +219,8 @@ def _as_mcp_servers(value: object) -> list:  # 小帮手：把 YAML 里的 mcp_s
                 headers=_as_str_map(spec.get("headers")),  # http：请求头
                 timeout=float(spec.get("timeout", 60.0)),  # 单请求超时（秒）
                 enabled=bool(spec.get("enabled", True)),  # 关掉就不连
+                # 延迟加载工具定义；默认开（见字段上的说明）。
+                defer_tools=bool(spec.get("defer_tools", True)),
             )
         )
     return servers

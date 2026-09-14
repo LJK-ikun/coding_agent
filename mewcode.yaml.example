@@ -30,6 +30,7 @@ mcp_servers: []
 #     env: {}                  # 额外环境变量
 #     cwd: ""                  # 子在哪个目录跑；留空 = 跟着 MewCode
 #     enabled: true            # 写 false 临时停用
+#     defer_tools: true        # 延迟加载工具参数定义（默认 true，见 README ch07）
 # 例(http 连法：直接往地址发请求)：
 #   - name: remote
 #     url: https://example.com/mcp

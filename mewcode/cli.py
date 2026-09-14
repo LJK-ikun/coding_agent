@@ -172,6 +172,8 @@ async def run(
     print(f"tools: {', '.join(registry.names())}")  # 提醒用户模型手上有哪些工具
     if mcp.servers:  # 连上的 server 报个数，让用户知道远端那半边是活的
         print(f"mcp: 已连接 {len(mcp.servers)} 个 server（{', '.join(mcp.servers)}），新增 {mcp_added} 个工具")
+    if mcp.deferred_count:  # 延迟加载：说清有多少工具的参数细节是"按需查"的
+        print(f"mcp: {mcp.deferred_count} 个工具延迟加载参数定义（模型要用时自会查）")
     if mcp_skipped:  # 撞名被跳过：必须说，不然用户会以为工具凭空少了
         print(f"mcp: {mcp_skipped} 个工具因重名跳过（本地工具优先，未被覆盖）")
     for name, err in mcp.errors.items():  # 连不上的：如实报出来，但不影响使用

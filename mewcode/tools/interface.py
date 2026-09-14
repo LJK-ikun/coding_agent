@@ -120,6 +120,9 @@ class Tool(ABC):
     name: str = ""  # 模型点名的短名
     description: str = ""  # 一句话说明
     parameters: Dict[str, Any] = {}  # 参数说明书（JSON Schema）
+    #: 延迟加载：为 True 时子类应覆写 to_api_schema() 少发点，把完整定义留在
+    #: full_schema() 里按需查。默认关——绝大多数本地工具说明很短，不值得多一次往返。
+    deferred: bool = False
 
     @abstractmethod  # 标记：任何子类都必须自己实现这个方法
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -129,11 +132,22 @@ class Tool(ABC):
         失败绝不抛穿，而是把报错文字交给模型调整）。
         """
 
+    def full_schema(self) -> Dict[str, Any]:  # 完整参数说明（延迟加载时按需取用）
+        """这个工具的**完整**参数 schema。
+
+        默认就是 ``parameters`` 本身。给"延迟加载"的工具留的口子：那类工具
+        平时只把精简版发出去，等模型真要用了，再从这儿取完整版。
+        """
+        return self.parameters  # 绝大多数工具：完整版就是 parameters 本身
+
     def to_api_schema(self) -> Dict[str, Any]:  # 导出给底层 API 认得的"工具长相"
         """导出底层 API（Anthropic Messages）认得的工具描述。
 
         字段刻意与 Anthropic 对齐：``{name, description, input_schema}``。
         OpenAI 侧在 client 里再做一次字段映射即可。
+
+        子类可以覆写它来"少发点"——比如远端工具的参数说明很长时，只发精简版，
+        把完整版留给按需查询（见 mcp/adapter.py 的 RemoteTool）。
         """
         return {  # 三个字段，Anthropic 原样能吃
             "name": self.name,  # 工具名

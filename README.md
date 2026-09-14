@@ -85,11 +85,40 @@ mcp__<server>__<工具名>      例:mcp__filesystem__read_file
 | `session.py` | 谁问的谁答的(id 配对、超时清理、握手) |
 | `adapter.py` | 远端工具 → 本地 `Tool`(加前缀、content 拍平成文字) |
 | `manager.py` | 一批 server 的管家(并发连、收工具、并发关) |
+| `lazy.py` | 延迟加载:发精简清单 + `describe_mcp_tool` 按需查完整定义 |
 
 两条贯穿全程的纪律:
 
 - **一个 server 连不上,不拖垮其他的。** 配错一个 server 只会记进 `errors` 并跳过,CLI 照常起来、本地工具照常用。为了一个配错的远端工具赔上整个程序,代价不成比例。
 - **失败是收据,不是异常。** 对端回 `isError`、连接断掉、超时——统统翻成失败收据喂回模型,让它读着改,而不是把整轮对话打断。
+
+### 延迟加载工具定义
+
+远端工具的参数说明动辄几百 token(枚举候选、嵌套对象、默认值、大段 NOTE)。接三个 server、每个二三十个工具,光工具清单就能吃掉几千 token——而模型一轮通常只用得上其中一两个。
+
+所以 MCP 工具默认走**延迟加载**:发给模型的只有
+
+- 工具名
+- 一行描述(多段大论截断到第一行)
+- 参数名 + 必填项
+
+参数的类型、枚举、详细描述全部砍掉,换取每轮都省一大截上下文。模型真要用了,先调一个本地工具 `describe_mcp_tool`:
+
+```
+describe_mcp_tool()                                  → 列出全部 MCP 工具(名字 + 一行说明)
+describe_mcp_tool(name="mcp__filesystem__read_file") → 给这一个的完整参数定义
+```
+
+**拿一次额外往返,换每轮都省。** 保留参数名是因为它猜不出来(类型猜错了模型会去查);砍掉必填项则会必然翻车,所以这两样留下。
+
+工具少、说明短的小 server 可以在配置里关掉这个开关:
+
+```yaml
+mcp_servers:
+  - name: tiny
+    command: my-small-server
+    defer_tools: false      # 默认 true
+```
 
 > 诚实的边界:本章是**客户端**,不做 server。HTTP 那条路只有单元测试覆盖(SSE 解析、批量 JSON),没对着真实远端 server 跑过完整链路;stdio 那条有真子进程的端到端测试。
 
@@ -158,10 +187,10 @@ python -m mewcode --mode strict   # ch06: 这次只想小心行事
 ## 怎么测
 
 ```bash
-python -m pytest          # 181 条用例:LLM 传输层 17 + 工具系统 16 + ch04 Agent 3 + ch05 指令工程 14 + ch06 安全检查 59 + ch07 MCP 72
+python -m pytest          # 200 条用例:LLM 传输层 17 + 工具系统 16 + ch04 Agent 3 + ch05 指令工程 14 + ch06 安全检查 59 + ch07 MCP 91
 ```
 
-ch07 那 72 条里,**70 条完全离线**(传输层用假 Transport 顶着,不起进程不联网),只有 T6 那 2 条真拉子进程跑端到端。
+ch07 那 91 条里,**88 条完全离线**(传输层用假 Transport 顶着,不起进程不联网),只有 T6 那 3 条真拉子进程跑端到端。
 
 ## 项目结构
 
@@ -186,6 +215,7 @@ mewcode/
     ├── transport.py  # 传输层:stdio 子进程 / streamable HTTP(+SSE 解析)
     ├── session.py    # 会话层:握手 + id 配对 + 超时清理
     ├── adapter.py    # 适配层:远端工具 → 本地 Tool(加前缀、content 拍平)
+    ├── lazy.py       # 延迟加载:精简清单 + describe_mcp_tool 按需查完整定义
     └── manager.py    # 连接池:一批 server 并发连/收工具/并发关
 ```
 
