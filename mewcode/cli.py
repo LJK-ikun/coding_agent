@@ -37,6 +37,7 @@ from .errors import LLMError, RateLimitError
 from .mcp.manager import McpManager  # ch07：MCP 连接池（一批远端 server 的管家）
 from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 system + 取环境
 from .instructions import load_instructions  # ch09：两层指令文件
+from .skills import UseSkillTool, load_skills  # ch10：技能文件（md 拆成名片+正文）
 from .notes import (  # ch09：自动笔记（两级 memory.md）
     load_notes,
     notes_block,
@@ -99,6 +100,7 @@ _ASK_MENU = (
 _ASK_CHOICES = {"1": GRANT_ONCE, "2": GRANT_SESSION, "3": GRANT_ALWAYS}
 
 
+# 人在回路的回调函数
 async def _ask_permission(req: PermissionRequest) -> str:
     """门卫判成 ask 时，Runner 会 await 到这个函数——这就是"问用户"本身。
 
@@ -182,9 +184,7 @@ async def _run_agent_turn(
         print("(no reply)")  # 流正常结束但模型没吐任何字时提示
     print()  # 收尾换行，回到输入提示
 
-# 主聊天循环 async
-# 整体功能
-# 初始化客户端/工具环境 -> 进入无限聊天循环 -> 读取用户输入 -> 处理内置命令 
+# 程序入口异步函数，整个agent应用的启动主函数。返回int一般是退出码：0代表正常结束，非0代表异常
 async def run(
     cfg: ProviderConfig,
     system: str = "",
@@ -193,6 +193,7 @@ async def run(
     project_instructions: str = "",  # ch09：指令正文(已读好、已拼好)，只为在启动屏报个数
     resume_id: str | None = None,  # ch09：--resume，接上指定的那个会话
     continue_last: bool = False,  # ch09：--continue，接上最近一条会话
+    skills: list | None = None,  # ch10：已读好的技能清单，目前只为在启动屏报个数
 ) -> int:
     client = create_client(cfg)
     cm = ConversationManager()
@@ -207,6 +208,10 @@ async def run(
         roots=cfg.sandbox_roots or None,  # YAML 没写 → 只允许项目根
         deny_patterns=cfg.extra_deny_patterns or None,  # 用户追加的黑名单
     )
+    # ch10：有技能才把 use_skill 挂上。一个技能都没有时不挂——否则模型手上
+    # 会多一个"永远只能回没有技能"的工具，白占上下文，还诱导它去调。
+    if skills:
+        registry.register(UseSkillTool(skills))
     runner = ToolRunner(registry, guard=engine, ask=_ask_permission)
     # ch08：造压缩器，再挂进 Agent——从此它每轮开工前会自己"量一量、瘦一瘦"。
     # 窗口大小、触发比例、保留比例都可以在 YAML 里调（见 config.py 格子 13~16）。
@@ -295,6 +300,9 @@ async def run(
             f"指令: 已加载（{len(project_instructions)} 字符，"
             f"注入 system 末尾，优先于通用规则）"
         )
+    # ch10：说清读到几个技能。技能文件写错位置时，这一行是唯一的线索。
+    if skills:
+        print(f"技能: {len(skills)} 个（{', '.join(s.name for s in skills)}）")
     # ch09：把会话和笔记的位置亮出来——不然用户不知道 /memory edit 该去改哪个文件
     print(f"会话: {session_id}  （存档 {store}）")
     print(f"笔记: 用户级 {user_notes}")
@@ -509,6 +517,7 @@ def main(argv: list[str] | None = None) -> int:
         #   ★ 只读这一次：指令属于"稳定前缀"，会话中途改文件不重读——
         #     重读会让前缀变、缓存全失效，而且"规则半路换了"比"改了没生效"更难查。
         project_instructions = load_instructions(os.getcwd())
+        skills = load_skills(os.getcwd())  # ch10：扫 .mewcode/skills/，读成技能清单
         stable_system = args.system if args.system else build_system_prompt(
             project_instructions=project_instructions
         )
@@ -521,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,  # 命令行没给就是 None，run 里回落到 cfg.permission_mode
                 resume_id=args.resume,
                 continue_last=args.continue_last,
+                skills=skills,  # ch10
             )
         )
     except KeyboardInterrupt:

@@ -231,3 +231,33 @@
 - [x] **离线端到端**：`tests/test_ch09_end_to_end.py` — 用假 `Agent` + 假 `create_client` + 假键盘真跑 `run()`，验证 7 条：落盘与名片 / `/clear` 归零 / `--continue` 接上旧会话 / 尾行崩坏照样起 / 未知 ID 当新会话 / 笔记整理失败不带走会话 / `/sessions`+`/memory` 不崩
 - [ ] **人工 live（需真实 key）**：`python -m mewcode` 聊两句 → `/exit` → `--continue` 重开，应见 `恢复: <id> — N 条消息` 且上一轮内容还在；`/sessions` 能列出这条；聊满 5 轮应见 `[笔记] 已更新`
 - [ ] **人工验证（存档格式）**：`.mewcode/sessions/<id>.jsonl` 一行一条、可读；`.mewcode/sessions/<id>.meta.json` 含 id/title/summary/messages/updated 五项
+
+---
+
+# MewCode — checklist.md（ch10 验收表 · 技能系统）
+
+> 测试载体：`tests/test_ch10_skills.py`。全部离线，每条自己造 tmp_path。
+
+## 读技能文件
+- [x] 技能目录不存在 → 返回 `[]`，不报错、不影响启动
+- [x] 正常文件 → `name`/`description` 从名片读出；`body` **不含** `---`、不含名片那几行
+- [x] 名片里没写 `name` → 用文件名兜底（`offline-test.md` → `offline-test`）
+- [x] 第一行不是 `---` → 没有名片，整篇当正文
+- [x] 名片开了头却没有收尾的 `---` → 当没有名片，那几行原样留在正文里（不猜）
+- [x] 读目录时排序 → 同一批文件每次读出的顺序一致（否则提示词前缀会抖，缓存必 miss）
+
+## 按需加载
+- [x] `use_skill(name="...")` 交回的正是那份技能的正文
+- [x] 名字查不到 → 失败收据，**且报错里列出可用技能**
+- [x] 没填 `name`（或空串）→ 失败收据，不抛异常
+- [x] 正文原样交回，不加"以下是技能说明"这类夹带的话
+
+## 省钱的机关
+- [x] `use_skill` 的 `description` 里**只有名片，没有正文**（`test_listing_only_has_namecards`）
+- [x] 导出的 schema 恰为 `{name, description, input_schema}` 三键，`required == ["name"]`
+- [x] 一个技能都没有时 `use_skill` 不注册——模型手上不会多一个空工具
+
+## 端到端验收
+- [x] **全量测试**：`python -m pytest` 全部通过（旧 262 + 新 10 = 272），退出码 0
+- [ ] **人工 live（需真实 key）**：`.mewcode/skills/` 放一份技能 → `python -m mewcode` 启动应见 `技能: 1 个（...）`；问一个该技能管得着的问题（例："这个项目的测试怎么写"），应见模型调 `use_skill`，正文回灌进历史后按它说的做
+- [ ] **人工验证（不挂空工具）**：把 `.mewcode/skills/` 清空重启 → 启动屏**不**报技能行，且工具清单里没有 `use_skill`
