@@ -38,6 +38,7 @@ from .mcp.manager import McpManager  # ch07：MCP 连接池（一批远端 serve
 from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 system + 取环境
 from .instructions import load_instructions  # ch09：两层指令文件
 from .skills import UseSkillTool, load_skills  # ch10：技能文件（md 拆成名片+正文）
+from .subagent import TaskTool  # ch11：子 agent（派活 + 上下文隔离）
 from .notes import (  # ch09：自动笔记（两级 memory.md）
     load_notes,
     notes_block,
@@ -212,6 +213,13 @@ async def run(
     # 会多一个"永远只能回没有技能"的工具，白占上下文，还诱导它去调。
     if skills:
         registry.register(UseSkillTool(skills))
+    # ch11：子 agent——把 task 挂上。它跟 use_skill 不一样：use_skill 有技能才挂，
+    #   task 是【永远都挂】——派活这个能力跟项目里有没有技能无关。
+    #   四个参数都是"喂进去的"（依赖注入）：execute 里的 kwargs 是模型填的，
+    #   只会有 prompt，不可能有 client / registry，所以只能从构造口进。
+    registry.register(
+        TaskTool(client, registry, guard=engine, ask=_ask_permission)
+    )
     runner = ToolRunner(registry, guard=engine, ask=_ask_permission)
     # ch08：造压缩器，再挂进 Agent——从此它每轮开工前会自己"量一量、瘦一瘦"。
     # 窗口大小、触发比例、保留比例都可以在 YAML 里调（见 config.py 格子 13~16）。

@@ -1,25 +1,6 @@
 # =============================================================
-# subagent.py —— 子 Agent 系统（ch11）
-#
-# 子 agent 是什么：**再跑一遍 Agent，但换一本新的对话历史。**
-#
-#     主 agent                          子 agent
-#       cm（主历史）                      cm2（新开，空的）
-#       ├ 用户: 配置怎么加载的?            ├ 用户: 去查清楚配置怎么加载
-#       ├ 我调了 task  ────────────────→  ├ 我调了 read_file
-#       │                                 ├ 我调了 search_code
-#       └ 拿到一条结论 ←────────────────  └ 结论: 配置从…
-#
-#   cm2 里那 30 条消息【跑完就扔】—— 这就是"上下文隔离"。
-#   子 agent 翻了多少文件，主历史里都看不到，只多一条结论。
-#
-# ★ 落点：子 agent 就是一个普通 Tool，跟 read_file / use_skill 平级。
-#   所以注册中心、执行器、门卫、超时、结果回灌，一条都不用改。
-#
-# ★ 为什么子 agent 要"重跑一遍 Agent"而不是自己写个循环？
-#   因为它要的能力（多轮调工具、收据回灌、到点停）主 agent 那段循环里
-#   全都有。再写一遍 = 两份要同步维护的代码。复用 Agent.run()，子 agent
-#   跟主 agent 的能力就永远是齐的。
+# 把子agent做成一个普通工具 task， 主agent调用这个工具，就会启动一个全新，上下文隔离的
+# 独立agent去干活；子agent内部所有多轮思考，读文件，调用工具的过程全部隐藏，只返回最终结论给主agent
 # =============================================================
 
 """子 agent：把"派一个小子 agent 去干件活"做成一个工具。"""
@@ -93,6 +74,7 @@ class TaskTool(Tool):
         self._guard = guard
         self._ask = ask
 
+    # **kwargs -- Python可变关键字参数
     async def execute(self, **kwargs: Any) -> ToolResult:
         prompt = str(kwargs.get("prompt") or "").strip()
         if not prompt:
