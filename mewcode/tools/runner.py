@@ -171,16 +171,20 @@ class ToolRunner:
             # 真正执行：套上超时，到点抛 TimeoutError。kwargs = 模型填的参数 dict
 
             # 第二步执行沙箱
+            # ch11：超时**优先用工具自己声明的**，它没声明才回落到 runner 的默认值。
+            #   写成 `is not None` 而不是 `or`，是为了让"声明了 0 秒"也算数——
+            #   `0 or x` 会得到 x，等于静默忽略了这个声明。
+            limit = tool.timeout if tool.timeout is not None else self._timeout
             raw: ToolResult = await asyncio.wait_for(
                 # tool.execute(**call.input) 被包装执行的异步函数，超时参数
-                tool.execute(**call.input), timeout=self._timeout
+                tool.execute(**call.input), timeout=limit
             )
             # 超时异常
         except asyncio.TimeoutError:  # 超时了
             return ToolCallResult(
                 tool_use_id=call.id,
                 content=(
-                    f"工具 {call.name!r} 执行超过 {self._timeout:g}s 被中止。"
+                    f"工具 {call.name!r} 执行超过 {limit:g}s 被中止。"
                     "若命令确实耗时，请缩小任务或分批执行。"
                 ),
                 is_error=True,

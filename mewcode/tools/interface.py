@@ -46,7 +46,7 @@ from __future__ import annotations  # 让类型注解能简洁书写
 
 from abc import ABC, abstractmethod  # ABC: 做"抽象基类"；abstractmethod: 标"必须实现的方法"
 from dataclasses import dataclass  # dataclass: 快速造"纯数据盒子"
-from typing import Any, Dict  # Any: 任何类型；Dict: 字典类型标注
+from typing import Any, Dict, Optional  # Any: 任何类型；Dict: 字典类型标注
 
 
 @dataclass  # 让 ToolResult 自动获得构造/打印等方法
@@ -123,6 +123,15 @@ class Tool(ABC):
     #: 延迟加载：为 True 时子类应覆写 to_api_schema() 少发点，把完整定义留在
     #: full_schema() 里按需查。默认关——绝大多数本地工具说明很短，不值得多一次往返。
     deferred: bool = False
+
+    #: ch11：这个工具【自己】要的超时（秒）。``None`` = 用 runner 的默认值。
+    #:
+    #: 用来给"天生就慢"的工具开小灶——比如子 agent（``task``），它要翻文件、
+    #: 要问好几轮模型，跑几分钟很正常，套死 runner 那个 120 秒必定被掐死。
+    #:
+    #: 默认 None 是有意的：**不声明 = 行为跟以前一模一样**，
+    #: ch03~ch10 那些工具一个都不用改。
+    timeout: Optional[float] = None
 
     @abstractmethod  # 标记：任何子类都必须自己实现这个方法
     async def execute(self, **kwargs: Any) -> ToolResult:
