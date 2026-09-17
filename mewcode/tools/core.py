@@ -40,6 +40,7 @@ from .interface import Tool, ToolResult  # 借地基：接口 + 收据
 _IGNORED_DIRS = {
     ".git", ".venv", "venv", "__pycache__", "node_modules",
     ".idea", ".vscode", ".ruff_cache", ".pytest_cache",
+    ".mewcode",
 }
 
 #: 判定"看起来是文本"的后缀白名单——够用即可，不追求完备

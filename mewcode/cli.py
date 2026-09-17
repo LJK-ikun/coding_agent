@@ -39,6 +39,7 @@ from .prompts import build_system_prompt, collect_env  # ch05：装配稳定 sys
 from .instructions import load_instructions  # ch09：两层指令文件
 from .skills import UseSkillTool, load_skills  # ch10：技能文件（md 拆成名片+正文）
 from .subagent import TaskTool  # ch11：子 agent（派活 + 上下文隔离）
+from .worktree import WorktreeTool, is_git_repo  # ch12：隔离工作区（git worktree）
 from .notes import (  # ch09：自动笔记（两级 memory.md）
     load_notes,
     notes_block,
@@ -220,6 +221,12 @@ async def run(
     registry.register(
         TaskTool(client, registry, guard=engine, ask=_ask_permission)
     )
+    # ch12：只在 git 仓库里挂 worktree 工具。
+    #   不在仓库里的话，它是个"永远只能回一句失败"的空工具——白占上下文，
+    #   还诱导模型去调。这跟上面"没技能就不挂 use_skill"是同一条原则。
+    #   判断只看工作根下有没有 .git，不起子进程（见 worktree.is_git_repo）。
+    if is_git_repo(os.getcwd()):
+        registry.register(WorktreeTool(base_dir=os.getcwd()))
     runner = ToolRunner(registry, guard=engine, ask=_ask_permission)
     # ch08：造压缩器，再挂进 Agent——从此它每轮开工前会自己"量一量、瘦一瘦"。
     # 窗口大小、触发比例、保留比例都可以在 YAML 里调（见 config.py 格子 13~16）。
